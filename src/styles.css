@@ -496,6 +496,71 @@ html:lang(zh-Hant) {
   z-index: 2;
 }
 
+.entry-date-filter {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+  padding: 0 0 8px;
+}
+
+.entry-date-btn {
+  flex: 1;
+  padding: 4px 0;
+  border-radius: 6px;
+  border: 1px solid var(--control-border);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+
+.entry-date-btn:hover {
+  background: var(--control-bg-hover, var(--control-bg));
+  color: var(--text-primary);
+}
+
+.entry-date-btn[data-active="true"] {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.entries-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-right: -8px;
+  padding-right: 8px;
+}
+
+.entries-scroll .list {
+  overflow-y: visible;
+  flex: 0 0 auto;
+  min-height: unset;
+}
+
+.search-box--entries {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  flex-shrink: 0;
+}
+
+.entries-search-loading,
+.entries-search-empty {
+  padding: 12px 16px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
 .viewer-header-row {
   display: flex;
   align-items: flex-start;
@@ -652,11 +717,6 @@ html:lang(zh-Hant) {
 
 .panel--entries .list > li {
   margin-right: 0;
-}
-
-.panel--entries .list {
-  margin-right: -8px;
-  padding-right: 8px;
 }
 
 .list-btn {
@@ -1472,6 +1532,13 @@ details summary:focus-visible,
 
 .user-msg .msg-header .line {
   color: var(--chat-user-line);
+}
+
+mark.search-highlight {
+  background: #facc15;
+  color: #1a1a1a;
+  border-radius: 2px;
+  padding: 0 1px;
 }
 
 .msg-text,

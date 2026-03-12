@@ -46,6 +46,10 @@ const state = {
   sourceToggles: { claude: true, codex: true },
   allClaudeProjects: [],
   allCodexProjects: [],
+  entrySearchQuery: "",
+  entrySearchResults: null,
+  isSearchingEntries: false,
+  entryDateFilter: "all",
   pendingSessionDeletes: [],
   pendingSessionDeleteCandidate: null,
   pendingProjectDelete: null,
@@ -66,6 +70,8 @@ const refs = {
   sourceToggleClaude: null,
   sourceToggleCodex: null,
   entriesList: null,
+  entriesSearchInput: null,
+  entryDateFilterWrap: null,
   viewerTitle: null,
   viewerMeta: null,
   viewerMetaPath: null,
@@ -119,6 +125,11 @@ function applyStaticTranslations() {
     if (!key) continue;
     node.setAttribute("aria-label", tt(key));
   }
+  for (const node of document.querySelectorAll("[data-i18n-placeholder]")) {
+    const key = node.getAttribute("data-i18n-placeholder");
+    if (!key) continue;
+    node.setAttribute("placeholder", tt(key));
+  }
 }
 
 function setStatus(message, type = "info") {
@@ -166,6 +177,24 @@ function escapeHtml(input) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+/**
+ * 將 text 中所有符合 query 的片段包在 <mark> 中，其餘部分 escapeHtml。
+ * 在原始文字上做比對，再分段 escape，避免 HTML entity 干擾搜尋。
+ */
+function highlightHtml(text, query) {
+  const str = String(text || "");
+  if (!query) return escapeHtml(str);
+  const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const parts = str.split(new RegExp(`(${escapedQuery})`, "gi"));
+  return parts
+    .map((part, i) =>
+      i % 2 === 1
+        ? `<mark class="search-highlight">${escapeHtml(part)}</mark>`
+        : escapeHtml(part),
+    )
+    .join("");
 }
 
 function decodeProjectLabel(encodedName) {
@@ -1190,6 +1219,80 @@ function renderViewerMeta(pathText, rightText = "") {
   if (refs.viewerMetaTime) refs.viewerMetaTime.textContent = String(rightText || "");
 }
 
+function getDateFilterRange(filter) {
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  if (filter === "today") {
+    return { from: todayStart, to: todayStart + 86400000 };
+  }
+  if (filter === "yesterday") {
+    return { from: todayStart - 86400000, to: todayStart };
+  }
+  if (filter === "week") {
+    const dow = now.getDay(); // 0=Sun
+    const daysFromMonday = dow === 0 ? 6 : dow - 1;
+    return { from: todayStart - daysFromMonday * 86400000, to: Infinity };
+  }
+  return null;
+}
+
+function isEntryInDateFilter(modifiedMs, filter) {
+  if (filter === "all" || !modifiedMs) return filter === "all";
+  const range = getDateFilterRange(filter);
+  if (!range) return true;
+  return modifiedMs >= range.from && modifiedMs < range.to;
+}
+
+function updateEntryDateFilterUI() {
+  if (!refs.entryDateFilterWrap) return;
+  for (const btn of refs.entryDateFilterWrap.querySelectorAll(".entry-date-btn")) {
+    const active = btn.dataset.filter === state.entryDateFilter;
+    btn.dataset.active = active ? "true" : "false";
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  }
+}
+
+let _entrySearchTimer = null;
+
+function scheduleEntrySearch(query) {
+  clearTimeout(_entrySearchTimer);
+  if (!query.trim()) {
+    state.entrySearchResults = null;
+    state.isSearchingEntries = false;
+    renderEntries();
+    return;
+  }
+  // 不在此處 re-render，保留目前顯示結果直到 debounce 結束，避免每個按鍵觸發 I/O 與畫面閃爍
+  _entrySearchTimer = setTimeout(async () => {
+    const capturedQuery = query;
+    const project = findSelectedProject();
+    if (!state.selectedProjectPath || !project?.claudePath) {
+      state.isSearchingEntries = false;
+      state.entrySearchResults = new Map();
+      renderEntries();
+      return;
+    }
+    state.isSearchingEntries = true;
+    renderEntries();
+    try {
+      // 若有日期篩選，只傳入符合時間條件的 session 路徑，避免讀取範圍外的檔案
+      const invokeArgs = { projectPath: project.claudePath, query: capturedQuery.trim() };
+      if (state.entryDateFilter !== "all") {
+        invokeArgs.paths = state.entries
+          .filter((e) => e.entryType === "session" && isEntryInDateFilter(e.modifiedMs, state.entryDateFilter))
+          .map((e) => e.path);
+      }
+      const results = await invoke("search_sessions", invokeArgs);
+      if (state.entrySearchQuery !== capturedQuery) return;
+      state.entrySearchResults = new Map(results.map((r) => [r.path, r.matchCount]));
+    } catch (_err) {
+      state.entrySearchResults = new Map();
+    }
+    state.isSearchingEntries = false;
+    renderEntries();
+  }, 300);
+}
+
 function renderEntries() {
   refs.entriesList.innerHTML = "";
   const memoryEntries = state.entries
@@ -1200,9 +1303,20 @@ function renderEntries() {
       if (aIsMain !== bIsMain) return aIsMain ? -1 : 1;
       return String(a.label || "").localeCompare(String(b.label || ""), "zh-TW");
     });
-  const sessionEntries = state.entries
+  const allSessionEntries = state.entries
     .filter((entry) => entry.entryType === "session")
     .sort((a, b) => (b.modifiedMs || 0) - (a.modifiedMs || 0));
+
+  const dateFilteredEntries = state.entryDateFilter !== "all"
+    ? allSessionEntries.filter((e) => isEntryInDateFilter(e.modifiedMs, state.entryDateFilter))
+    : allSessionEntries;
+
+  const searchResults = state.entrySearchResults;
+  const isSearchFiltering = searchResults !== null && !state.isSearchingEntries;
+  const sessionEntries = isSearchFiltering
+    ? dateFilteredEntries.filter((e) => searchResults.has(e.path))
+    : dateFilteredEntries;
+
   const subagentsByParent = new Map();
 
   for (const entry of state.entries) {
@@ -1236,10 +1350,29 @@ function renderEntries() {
     refs.entriesList.appendChild(divider);
   }
 
-  if (sessionEntries.length > 0) {
+  if (state.isSearchingEntries) {
+    const loadingLi = document.createElement("li");
+    loadingLi.className = "entries-search-loading";
+    loadingLi.setAttribute("aria-live", "polite");
+    loadingLi.textContent = tt("status.loadingContent");
+    refs.entriesList.appendChild(loadingLi);
+    return;
+  }
+
+  if (allSessionEntries.length > 0) {
     refs.entriesList.appendChild(
       createEntriesSectionTitle(`${tt("panel.session")} FILES`, sessionEntries.length, "sessions"),
     );
+  }
+
+  if (sessionEntries.length === 0 && allSessionEntries.length > 0) {
+    const emptyLi = document.createElement("li");
+    emptyLi.className = "entries-search-empty";
+    emptyLi.textContent = isSearchFiltering
+      ? tt("placeholder.entriesNoResults")
+      : tt("placeholder.entriesDateNoResults");
+    refs.entriesList.appendChild(emptyLi);
+    return;
   }
 
   for (const entry of sessionEntries) {
@@ -1248,10 +1381,13 @@ function renderEntries() {
     const hasChildren = children.length > 0;
     const expanded = hasChildren ? Boolean(state.entryExpandState[sessionStem]) : false;
 
+    const matchCount = isSearchFiltering && searchResults.has(entry.path) ? searchResults.get(entry.path) : 0;
+    const matchLabel = matchCount > 0 ? tt("entry.matchCount", { count: matchCount }) : "";
+
     const li = document.createElement("li");
     const row = createElement("div", "entry-row list-row");
     if (hasChildren) row.dataset.hasChildren = "true";
-    row.appendChild(createEntryButton(entry, { hasChildren }));
+    row.appendChild(createEntryButton(entry, { hasChildren, typeLabel: matchLabel }));
 
     let toggle = null;
     if (hasChildren) {
@@ -2782,8 +2918,13 @@ function renderChatItem(item) {
   );
   const isLong = fullText.length > CHAT_PREVIEW_LENGTH;
   let expanded = false;
+  const searchQuery = String(state.timelineSearchQuery || "").trim().toLowerCase();
   const textClass = item.kind === "chat_user" ? "msg-text user-msg-text" : "assist-text";
-  const body = createElement("p", textClass, isLong ? truncateText(fullText, CHAT_PREVIEW_LENGTH) : fullText);
+  const body = createElement("p", textClass);
+  body.innerHTML = highlightHtml(
+    isLong ? truncateText(fullText, CHAT_PREVIEW_LENGTH) : fullText,
+    searchQuery,
+  );
 
   let contentRoot = bubble;
   if (item.kind === "chat_assistant") {
@@ -2803,7 +2944,10 @@ function renderChatItem(item) {
     toggle.type = "button";
     toggle.addEventListener("click", () => {
       expanded = !expanded;
-      body.textContent = expanded ? fullText : truncateText(fullText, CHAT_PREVIEW_LENGTH);
+      body.innerHTML = highlightHtml(
+        expanded ? fullText : truncateText(fullText, CHAT_PREVIEW_LENGTH),
+        searchQuery,
+      );
       toggle.textContent = expanded ? tt("action.collapseContent") : tt("action.expandContent");
     });
     contentRoot.append(toggle);
@@ -3144,7 +3288,6 @@ function renderTimeline(payload) {
 
   state.parseErrorCode = payload.errorCode || "";
   state.parseErrors = Array.isArray(payload.errors) ? payload.errors : [];
-  resetViewerSearchQuery();
   state.techViewState = {};
   state.timelineItems = buildTimelineItems(events);
 
@@ -3230,6 +3373,8 @@ function initDomRefs() {
     sourceToggleClaude: "#source-toggle-claude",
     sourceToggleCodex: "#source-toggle-codex",
     entriesList: "#entries-list",
+    entriesSearchInput: "#entries-search-input",
+    entryDateFilterWrap: "#entry-date-filter",
     viewerTitle: "#viewer-title",
     viewerMeta: "#viewer-meta",
     viewerMetaPath: "#viewer-meta-path",
@@ -3329,6 +3474,12 @@ async function loadProjects() {
 
 async function selectProject(projectPath) {
   state.selectedProjectPath = projectPath;
+  state.entrySearchQuery = "";
+  state.entrySearchResults = null;
+  state.isSearchingEntries = false;
+  state.entryDateFilter = "all";
+  if (refs.entriesSearchInput) refs.entriesSearchInput.value = "";
+  updateEntryDateFilterUI();
   clearSelectedEntryState();
   renderProjects();
   setInfoStatus("status.loadingEntries");
@@ -3376,7 +3527,13 @@ async function selectEntry(entry) {
   const hideSystemEventsControl = entry.entryType === "memory_file";
   setHideSystemEventsVisible(!hideSystemEventsControl);
   setViewerSearchVisible(entry.entryType !== "memory_file");
-  resetViewerSearchQuery();
+  const carryQuery = entry.entryType !== "memory_file" ? state.entrySearchQuery.trim() : "";
+  if (carryQuery) {
+    state.timelineSearchQuery = carryQuery;
+    if (refs.viewerSearchInput) refs.viewerSearchInput.value = carryQuery;
+  } else {
+    resetViewerSearchQuery();
+  }
   renderLoadingMeta(entry);
 
   try {
@@ -3434,6 +3591,17 @@ window.addEventListener("DOMContentLoaded", async () => {
   bindInputText(refs.viewerSearchInput, (value) => {
     state.timelineSearchQuery = value;
     renderTimelineView();
+  });
+  bindInputText(refs.entriesSearchInput, (value) => {
+    state.entrySearchQuery = value;
+    scheduleEntrySearch(value);
+  });
+  bindClick(refs.entryDateFilterWrap, (e) => {
+    const btn = e.target.closest(".entry-date-btn");
+    if (!btn) return;
+    state.entryDateFilter = btn.dataset.filter;
+    updateEntryDateFilterUI();
+    renderEntries();
   });
   bindClick(refs.projectDeleteCancelButton, () => {
     closeProjectDeleteDialog();

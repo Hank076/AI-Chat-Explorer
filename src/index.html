@@ -107,8 +107,8 @@
               <input
                 id="projects-search-input"
                 type="search"
-                placeholder="Search projects..."
-                aria-label="Search projects"
+                data-i18n-placeholder="project.searchPlaceholder"
+                data-i18n-aria-label="project.searchAria"
                 autocomplete="off"
                 spellcheck="false"
               />
@@ -131,7 +131,29 @@
             <h2 data-i18n="panel.session">Sessions</h2>
             <span class="panel-kpi">S</span>
           </div>
-          <ul id="entries-list" class="list"></ul>
+          <div id="entry-date-filter" class="entry-date-filter" role="tablist" data-i18n-aria-label="filter.ariaLabel">
+            <button class="entry-date-btn" type="button" role="tab" data-filter="all" data-active="true" aria-selected="true" data-i18n="filter.all">All</button>
+            <button class="entry-date-btn" type="button" role="tab" data-filter="today" data-active="false" aria-selected="false" data-i18n="filter.today">Today</button>
+            <button class="entry-date-btn" type="button" role="tab" data-filter="yesterday" data-active="false" aria-selected="false" data-i18n="filter.yesterday">Yesterday</button>
+            <button class="entry-date-btn" type="button" role="tab" data-filter="week" data-active="false" aria-selected="false" data-i18n="filter.week">This week</button>
+          </div>
+          <div class="entries-scroll">
+            <div class="search-box search-box--entries">
+              <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <circle cx="11" cy="11" r="7"></circle>
+                <path d="M20 20L16.65 16.65"></path>
+              </svg>
+              <input
+                id="entries-search-input"
+                type="search"
+                data-i18n-placeholder="session.searchPlaceholder"
+                data-i18n-aria-label="session.searchAria"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </div>
+            <ul id="entries-list" class="list"></ul>
+          </div>
         </aside>
 
         <div
@@ -202,8 +224,8 @@
             <input
               id="viewer-search-input"
               type="search"
-              placeholder="搜尋對話..."
-              aria-label="Search messages"
+              data-i18n-placeholder="viewer.searchPlaceholder"
+              data-i18n-aria-label="viewer.searchAria"
               autocomplete="off"
               spellcheck="false"
             />

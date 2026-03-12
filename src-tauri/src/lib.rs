@@ -9,6 +9,7 @@ pub fn run() {
             project_browser::list_project_entries,
             project_browser::read_memory,
             project_browser::read_session_timeline,
+            project_browser::search_sessions,
             project_browser::delete_session,
             project_browser::delete_project,
             project_browser::get_project_delete_impact,

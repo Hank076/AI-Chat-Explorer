@@ -127,6 +127,14 @@ pub struct CodexProjectDiscoveryMode {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSearchResult {
+    path: String,
+    match_count: usize,
+    source: String,
+}
+
 #[derive(Debug, Default)]
 struct SessionMetadataAccumulator {
     model_name: Option<String>,
@@ -427,6 +435,98 @@ pub fn read_session_timeline(
         events,
         metadata: metadata_accumulator.build_metadata(start_time, end_time),
     })
+}
+
+#[tauri::command]
+pub fn search_sessions(
+    project_path: String,
+    query: String,
+    base_path: Option<String>,
+    paths: Option<Vec<String>>,
+) -> Result<Vec<SessionSearchResult>, String> {
+    let root = resolve_root_path(base_path.as_deref())?;
+    let project = validate_under_root(&root, Path::new(&project_path))?;
+    if !project.is_dir() {
+        return Err(ERR_NOT_FOUND.to_string());
+    }
+
+    let query_lower = query.to_lowercase();
+    if query_lower.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let all_files: Vec<PathBuf> = if let Some(path_strings) = paths {
+        // Targeted search: only search caller-specified files (validate each against root)
+        let mut files = Vec::new();
+        for path_str in path_strings {
+            match validate_under_root(&root, Path::new(&path_str)) {
+                Ok(canonical) if canonical.is_file() && has_jsonl_extension(&canonical) => {
+                    files.push(canonical);
+                }
+                _ => continue,
+            }
+        }
+        files
+    } else {
+        // Full discovery: collect top-level session files + subagent files
+        let mut session_files: Vec<PathBuf> = Vec::new();
+        let mut stems: Vec<String> = Vec::new();
+
+        for item in fs::read_dir(&project).map_err(map_read_error)? {
+            let item = item.map_err(map_read_error)?;
+            let path = item.path();
+            if path.is_file() && has_jsonl_extension(&path) {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    stems.push(stem.to_string());
+                }
+                session_files.push(path);
+            }
+        }
+
+        let mut all = session_files;
+        for stem in &stems {
+            let subagents_dir = project.join(stem).join("subagents");
+            if !subagents_dir.is_dir() {
+                continue;
+            }
+            for item in fs::read_dir(&subagents_dir).map_err(map_read_error)? {
+                let item = item.map_err(map_read_error)?;
+                let path = item.path();
+                if path.is_file() && has_jsonl_extension(&path) {
+                    all.push(path);
+                }
+            }
+        }
+        all
+    };
+
+    let mut results = Vec::new();
+    for file_path in all_files {
+        let file = match fs::File::open(&file_path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let reader = BufReader::new(file);
+        let mut match_count: usize = 0;
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if line.to_lowercase().contains(&query_lower) {
+                match_count += 1;
+            }
+        }
+        if match_count > 0 {
+            results.push(SessionSearchResult {
+                path: file_path.to_string_lossy().to_string(),
+                match_count,
+                source: "claude".to_string(),
+            });
+        }
+    }
+
+    Ok(results)
 }
 
 #[tauri::command]
