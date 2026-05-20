@@ -73,7 +73,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "Unified AI Session Explorer ${{ github.ref_name }}"
+          releaseName: "AI Chat Explorer ${{ github.ref_name }}"
           releaseBody: "Automated release for ${{ github.ref_name }}"
           releaseDraft: false
           prerelease: false
