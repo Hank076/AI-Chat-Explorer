@@ -952,6 +952,12 @@ html:lang(zh-Hant) {
   padding: 0 8px;
 }
 
+.entries-section-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .entry-row {
   position: relative;
   align-items: center;
@@ -1984,4 +1990,8 @@ body.resizing-columns {
   display: flex;
   gap: 4px;
   margin-top: 2px;
+}
+
+.project-sources .source-badge {
+  margin-left: 0;
 }

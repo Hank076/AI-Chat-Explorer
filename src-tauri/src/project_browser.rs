@@ -44,6 +44,7 @@ pub struct Entry {
     modified_ms: Option<u64>,
     size_bytes: Option<u64>,
     source: String,
+    hidden: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -243,6 +244,7 @@ fn build_entry(entry_type: &str, path: &Path, label: String, parent_session: Opt
         modified_ms,
         size_bytes,
         source: source.to_string(),
+        hidden: false,
     }
 }
 
@@ -2241,6 +2243,113 @@ fn build_codex_entry_label(title: Option<String>, first_user_message: Option<Str
     file_name_or(Path::new(rollout_path), "session")
 }
 
+#[derive(Debug, Clone, Default)]
+struct CodexRolloutHeadSummary {
+    saw_session_meta: bool,
+    preview: Option<String>,
+    first_user_message: Option<String>,
+}
+
+fn codex_strip_user_message_prefix(message: &str) -> &str {
+    const USER_MESSAGE_BEGIN: &str = "USER_MESSAGE_BEGIN";
+    message
+        .strip_prefix(USER_MESSAGE_BEGIN)
+        .unwrap_or(message)
+        .trim()
+}
+
+fn codex_event_msg_preview(payload: &Value) -> Option<String> {
+    match payload.get("type").and_then(|v| v.as_str()) {
+        Some("user_message") => {
+            let message = payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(codex_strip_user_message_prefix)
+                .unwrap_or("");
+            if !message.is_empty() {
+                return Some(message.to_string());
+            }
+            let has_images = payload
+                .get("images")
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| !arr.is_empty())
+                || payload
+                    .get("local_images")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|arr| !arr.is_empty());
+            has_images.then(|| "[Image]".to_string())
+        }
+        Some("thread_goal_updated") => payload
+            .get("goal")
+            .and_then(|v| v.get("objective"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|objective| !objective.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+fn read_codex_rollout_head_summary(path: &Path) -> CodexRolloutHeadSummary {
+    const HEAD_RECORD_LIMIT: usize = 10;
+    const USER_EVENT_SCAN_LIMIT: usize = 200;
+
+    let Ok(file) = fs::File::open(path) else {
+        return CodexRolloutHeadSummary::default();
+    };
+    let reader = BufReader::new(file);
+    let mut summary = CodexRolloutHeadSummary::default();
+    let mut lines_scanned = 0usize;
+
+    for line_result in reader.lines() {
+        if lines_scanned >= HEAD_RECORD_LIMIT
+            && !(summary.saw_session_meta
+                && (summary.preview.is_none() || summary.first_user_message.is_none())
+                && lines_scanned < HEAD_RECORD_LIMIT + USER_EVENT_SCAN_LIMIT)
+        {
+            break;
+        }
+
+        let Ok(line) = line_result else { continue };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        lines_scanned += 1;
+
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("session_meta") => {
+                summary.saw_session_meta = true;
+            }
+            Some("event_msg") => {
+                let Some(payload) = value.get("payload") else {
+                    continue;
+                };
+                if let Some(preview) = codex_event_msg_preview(payload) {
+                    if summary.preview.is_none() {
+                        summary.preview = Some(preview.clone());
+                    }
+                    if payload.get("type").and_then(|v| v.as_str()) == Some("user_message")
+                        && summary.first_user_message.is_none()
+                    {
+                        summary.first_user_message = Some(preview);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    summary
+}
+
+fn codex_rollout_is_visible_in_thread_list(summary: &CodexRolloutHeadSummary) -> bool {
+    summary.saw_session_meta && summary.preview.is_some()
+}
+
 fn collect_codex_session_files_from_scan(sessions_root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let Ok(year_entries) = fs::read_dir(sessions_root) else { return files };
@@ -2329,10 +2438,16 @@ fn list_codex_project_entries_from_scan(cwd: &str, sessions_root: &Path) -> Vec<
         if normalize_cwd_for_comparison(&file_cwd) != norm_target {
             continue;
         }
-        let label = file
+        let summary = read_codex_rollout_head_summary(&file);
+        let fallback_label = file
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        let label = summary
+            .preview
+            .clone()
+            .filter(|preview| !preview.trim().is_empty())
+            .unwrap_or(fallback_label);
         let (modified_ms, size_bytes) = get_file_metadata(&file);
         entries.push(Entry {
             entry_type: "session".to_string(),
@@ -2342,11 +2457,53 @@ fn list_codex_project_entries_from_scan(cwd: &str, sessions_root: &Path) -> Vec<
             modified_ms,
             size_bytes,
             source: "codex".to_string(),
+            hidden: !codex_rollout_is_visible_in_thread_list(&summary),
         });
     }
 
     entries.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
     entries
+}
+
+fn append_hidden_codex_project_entries_from_scan(
+    entries: &mut Vec<Entry>,
+    cwd: &str,
+    sessions_root: &Path,
+) {
+    let mut seen_paths: HashSet<String> = entries.iter().map(|entry| entry.path.clone()).collect();
+    let norm_target = normalize_cwd_for_comparison(cwd);
+    for file in collect_codex_session_files_from_scan(sessions_root) {
+        let path = file.to_string_lossy().to_string();
+        if seen_paths.contains(&path) {
+            continue;
+        }
+        let Some(file_cwd) = extract_codex_session_cwd_from_scan(&file) else {
+            continue;
+        };
+        if normalize_cwd_for_comparison(&file_cwd) != norm_target {
+            continue;
+        }
+        let summary = read_codex_rollout_head_summary(&file);
+        if codex_rollout_is_visible_in_thread_list(&summary) {
+            continue;
+        }
+        let label = file
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let (modified_ms, size_bytes) = get_file_metadata(&file);
+        entries.push(Entry {
+            entry_type: "session".to_string(),
+            label,
+            path: path.clone(),
+            parent_session: None,
+            modified_ms,
+            size_bytes,
+            source: "codex".to_string(),
+            hidden: true,
+        });
+        seen_paths.insert(path);
+    }
 }
 
 fn query_codex_project_entries_by_candidates(
@@ -2389,6 +2546,7 @@ fn query_codex_project_entries_by_candidates(
             continue;
         }
         let (file_modified_ms, size_bytes) = get_file_metadata(path);
+        let hidden = !codex_rollout_is_visible_in_thread_list(&read_codex_rollout_head_summary(path));
         entries.push(Entry {
             entry_type: "session".to_string(),
             label: build_codex_entry_label(title, first_user_message, &rollout_path),
@@ -2397,6 +2555,7 @@ fn query_codex_project_entries_by_candidates(
             modified_ms: updated_ms.or(file_modified_ms),
             size_bytes,
             source: "codex".to_string(),
+            hidden,
         });
     }
 
@@ -2433,6 +2592,7 @@ fn query_all_codex_project_entries(connection: &Connection, target_norm: &str) -
             continue;
         }
         let (file_modified_ms, size_bytes) = get_file_metadata(path);
+        let hidden = !codex_rollout_is_visible_in_thread_list(&read_codex_rollout_head_summary(path));
         entries.push(Entry {
             entry_type: "session".to_string(),
             label: build_codex_entry_label(title, first_user_message, &rollout_path),
@@ -2441,6 +2601,7 @@ fn query_all_codex_project_entries(connection: &Connection, target_norm: &str) -
             modified_ms: updated_ms.or(file_modified_ms),
             size_bytes,
             source: "codex".to_string(),
+            hidden,
         });
     }
 
@@ -2520,15 +2681,19 @@ fn list_codex_projects_from_db(db_path: &Path) -> rusqlite::Result<Vec<Project>>
 
 #[tauri::command]
 pub fn list_codex_project_entries(cwd: String) -> Result<Vec<Entry>, String> {
+    let sessions_root = default_codex_sessions_path().ok();
     if let Ok(Some(db_path)) = find_codex_db_path() {
-        if let Ok(entries) = list_codex_project_entries_from_db(&cwd, &db_path) {
+        if let Ok(mut entries) = list_codex_project_entries_from_db(&cwd, &db_path) {
+            if let Some(sessions_root) = sessions_root.as_ref().filter(|path| path.exists()) {
+                append_hidden_codex_project_entries_from_scan(&mut entries, &cwd, sessions_root);
+                entries.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+            }
             return Ok(entries);
         }
     }
 
-    let sessions_root = match default_codex_sessions_path() {
-        Ok(path) => path,
-        Err(_) => return Ok(vec![]),
+    let Some(sessions_root) = sessions_root else {
+        return Ok(vec![]);
     };
     if !sessions_root.exists() {
         return Ok(vec![]);
@@ -2576,7 +2741,14 @@ fn accumulate_codex_metadata(accum: &mut SessionMetadataAccumulator, raw: &Value
         let payload_type = payload.and_then(|p| p.get("type")).and_then(|v| v.as_str());
         if payload_type == Some("token_count") {
             if let Some(info) = payload.and_then(|p| p.get("info")) {
-                if let Some(last) = info.get("last_token_usage") {
+                if let Some(total) = info.get("total_token_usage") {
+                    accum.total_input_tokens =
+                        total.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    accum.total_output_tokens =
+                        total.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    accum.total_cache_read_input_tokens =
+                        total.get("cached_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                } else if let Some(last) = info.get("last_token_usage") {
                     accum.total_input_tokens += last.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                     accum.total_output_tokens += last.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                     accum.total_cache_read_input_tokens += last.get("cached_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -2584,6 +2756,95 @@ fn accumulate_codex_metadata(accum: &mut SessionMetadataAccumulator, raw: &Value
             }
         }
     }
+}
+
+fn codex_event_msg_text(payload: &Value) -> String {
+    let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    if !message.trim().is_empty() {
+        return message.to_string();
+    }
+    let has_images = payload
+        .get("images")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| !arr.is_empty())
+        || payload
+            .get("local_images")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| !arr.is_empty());
+    if has_images {
+        "[Image]".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn codex_reasoning_event_text(payload: &Value) -> String {
+    payload
+        .get("text")
+        .or_else(|| payload.get("content"))
+        .or_else(|| payload.get("delta"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn codex_response_message_text(payload: &Value) -> String {
+    payload
+        .get("content")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let t = item.get("type").and_then(|v| v.as_str());
+                    if matches!(t, Some("output_text") | Some("input_text") | Some("text")) {
+                        item.get("text").and_then(|v| v.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn codex_structured_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(codex_structured_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(|v| v.as_str()) {
+                return text.to_string();
+            }
+            if let Some(content) = map.get("content") {
+                let text = codex_structured_text(content);
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            if let Some(content_items) = map.get("content_items") {
+                let text = codex_structured_text(content_items);
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+fn codex_tool_output_text(payload: &Value) -> String {
+    payload
+        .get("output")
+        .map(codex_structured_text)
+        .unwrap_or_default()
 }
 
 fn build_codex_timeline_event(line: usize, raw: Value) -> TimelineEvent {
@@ -2602,18 +2863,21 @@ fn build_codex_timeline_event(line: usize, raw: Value) -> TimelineEvent {
     match (outer_type, payload_type) {
         ("event_msg", "user_message") => {
             role = Some("user".to_string());
-            let msg = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            summary = truncate(msg, 240);
+            summary = truncate(&codex_event_msg_text(&payload), 240);
         }
         ("event_msg", "agent_message") => {
             role = Some("assistant".to_string());
-            let msg = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            summary = truncate(msg, 240);
+            summary = truncate(&codex_event_msg_text(&payload), 240);
         }
         ("event_msg", "agent_reasoning") => {
             role = Some("assistant".to_string());
-            let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            summary = truncate(text, 240);
+            let text = codex_reasoning_event_text(&payload);
+            summary = truncate(&text, 240);
+        }
+        ("event_msg", "agent_reasoning_raw_content") => {
+            role = Some("assistant".to_string());
+            let text = codex_reasoning_event_text(&payload);
+            summary = truncate(&text, 240);
         }
         ("response_item", "function_call") => {
             let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2623,9 +2887,8 @@ fn build_codex_timeline_event(line: usize, raw: Value) -> TimelineEvent {
             summary = truncate(&format!("{name} {args}"), 240);
         }
         ("response_item", "function_call_output") => {
-            let output = payload.get("output").and_then(|v| v.as_str()).unwrap_or("");
             tool_use_id = payload.get("call_id").and_then(|v| v.as_str()).map(str::to_string);
-            summary = truncate(output, 240);
+            summary = truncate(&codex_tool_output_text(&payload), 240);
         }
         ("response_item", "custom_tool_call") => {
             let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2635,9 +2898,19 @@ fn build_codex_timeline_event(line: usize, raw: Value) -> TimelineEvent {
             summary = truncate(&format!("{name}: {input}"), 240);
         }
         ("response_item", "custom_tool_call_output") => {
-            let output = payload.get("output").and_then(|v| v.as_str()).unwrap_or("");
             tool_use_id = payload.get("call_id").and_then(|v| v.as_str()).map(str::to_string);
-            summary = truncate(output, 240);
+            summary = truncate(&codex_tool_output_text(&payload), 240);
+        }
+        ("response_item", "local_shell_call") => {
+            tool_use_id = payload.get("call_id").and_then(|v| v.as_str()).map(str::to_string);
+            operation = Some("local_shell_call".to_string());
+            let status = payload.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let command = payload
+                .get("action")
+                .and_then(|v| v.get("command").or_else(|| v.get("cmd")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            summary = truncate(&format!("{status} {command}").trim(), 240);
         }
         ("response_item", "reasoning") => {
             role = Some("assistant".to_string());
@@ -2652,18 +2925,7 @@ fn build_codex_timeline_event(line: usize, raw: Value) -> TimelineEvent {
         }
         ("response_item", "message") => {
             role = payload.get("role").and_then(|v| v.as_str()).map(str::to_string);
-            let text = payload
-                .get("content")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.iter().find_map(|item| {
-                    let t = item.get("type").and_then(|v| v.as_str());
-                    if matches!(t, Some("output_text") | Some("input_text") | Some("text")) {
-                        item.get("text").and_then(|v| v.as_str()).map(str::to_string)
-                    } else {
-                        None
-                    }
-                }))
-                .unwrap_or_default();
+            let text = codex_response_message_text(&payload);
             summary = truncate(&text, 240);
         }
         ("session_meta", _) => {
@@ -2709,6 +2971,15 @@ fn build_codex_timeline_event(line: usize, raw: Value) -> TimelineEvent {
     }
 }
 
+fn is_codex_legacy_ghost_snapshot_rollout_line(raw: &Value) -> bool {
+    raw.get("type").and_then(|v| v.as_str()) == Some("response_item")
+        && raw
+            .get("payload")
+            .and_then(|p| p.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("ghost_snapshot")
+}
+
 #[tauri::command]
 pub fn read_codex_session_timeline(session_path: String) -> Result<SessionTimelinePayload, String> {
     let target = Path::new(&session_path);
@@ -2731,6 +3002,9 @@ pub fn read_codex_session_timeline(session_path: String) -> Result<SessionTimeli
         if line.trim().is_empty() { continue; }
         match serde_json::from_str::<Value>(line) {
             Ok(value) => {
+                if is_codex_legacy_ghost_snapshot_rollout_line(&value) {
+                    continue;
+                }
                 accumulate_codex_metadata(&mut metadata_accumulator, &value);
                 events.push(build_codex_timeline_event(line_number, value));
             }
@@ -3346,6 +3620,44 @@ mod tests {
     }
 
     #[test]
+    fn list_codex_project_entries_marks_rollouts_without_thread_preview_hidden() {
+        let sessions_root = unique_temp_dir("codex-hidden-rollouts");
+        let day_dir = sessions_root.join("2026").join("03").join("12");
+        fs::create_dir_all(&day_dir).expect("create day dir");
+        write_file(
+            &day_dir.join("visible.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"D:\\\\repo\\\\demo\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"visible prompt\"}}\n"
+            ),
+        );
+        write_file(
+            &day_dir.join("no-preview.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"D:\\\\repo\\\\demo\"}}\n",
+        );
+        write_file(
+            &day_dir.join("no-meta.jsonl"),
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"missing meta\"}}\n",
+        );
+
+        let entries = list_codex_project_entries_from_scan(r"D:\repo\demo", &sessions_root);
+        let visible = entries
+            .iter()
+            .find(|entry| entry.label == "visible prompt")
+            .expect("visible entry");
+        let hidden = entries
+            .iter()
+            .find(|entry| entry.label == "no-preview.jsonl")
+            .expect("hidden entry");
+
+        assert_eq!(visible.hidden, false);
+        assert_eq!(hidden.hidden, true);
+        assert!(entries.iter().all(|entry| entry.label != "no-meta.jsonl"));
+
+        fs::remove_dir_all(sessions_root).expect("cleanup");
+    }
+
+    #[test]
     fn get_project_delete_impact_combines_claude_and_codex_entries() {
         clear_project_cwd_cache();
         let claude_root = unique_temp_dir("delete-impact-claude");
@@ -3612,6 +3924,57 @@ mod tests {
     }
 
     #[test]
+    fn test_append_hidden_codex_entries_from_scan_adds_rollouts_missing_from_db() {
+        let dir = unique_temp_dir("codex-db-hidden-scan");
+        let db_path = dir.join("state_5.sqlite");
+        build_test_codex_db(&db_path);
+        let day_dir = dir.join("sessions").join("2026").join("03").join("12");
+        fs::create_dir_all(&day_dir).expect("create day dir");
+        let visible_session = day_dir.join("visible.jsonl");
+        let hidden_session = day_dir.join("hidden.jsonl");
+        write_file(
+            &visible_session,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"D:\\\\repo\\\\demo\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"visible prompt\"}}\n"
+            ),
+        );
+        write_file(
+            &hidden_session,
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"D:\\\\repo\\\\demo\"}}\n",
+        );
+
+        let connection = Connection::open(&db_path).expect("open sqlite db");
+        connection
+            .execute(
+                "INSERT INTO threads (id, cwd, rollout_path, title, first_user_message, created_at, updated_at, archived)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+                (
+                    "thread-visible",
+                    r"D:\repo\demo",
+                    visible_session.to_string_lossy().to_string(),
+                    "Visible Title",
+                    "visible prompt",
+                    1_i64,
+                    30_i64,
+                ),
+            )
+            .expect("insert visible thread");
+
+        let mut entries = list_codex_project_entries_from_db(r"D:\repo\demo", &db_path)
+            .expect("list codex entries from db");
+        append_hidden_codex_project_entries_from_scan(&mut entries, r"D:\repo\demo", &dir.join("sessions"));
+        entries.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry.label == "Visible Title" && !entry.hidden));
+        assert!(entries.iter().any(|entry| entry.label == "hidden.jsonl" && entry.hidden));
+
+        drop(connection);
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
     fn test_build_codex_timeline_event_user_message() {
         let raw = serde_json::json!({
             "timestamp": "2026-01-01T00:00:00Z",
@@ -3644,6 +4007,57 @@ mod tests {
     }
 
     #[test]
+    fn test_build_codex_timeline_event_agent_reasoning_raw_content() {
+        let raw = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_reasoning_raw_content",
+                "text": "Raw reasoning stream"
+            }
+        });
+        let event = build_codex_timeline_event(2, raw);
+        assert_eq!(event.role, Some("assistant".to_string()));
+        assert_eq!(event.subtype, Some("agent_reasoning_raw_content".to_string()));
+        assert_eq!(event.summary, "Raw reasoning stream");
+    }
+
+    #[test]
+    fn test_build_codex_timeline_event_image_user_message() {
+        let raw = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "",
+                "local_images": [{"path": "C:/tmp/screenshot.png"}]
+            }
+        });
+        let event = build_codex_timeline_event(2, raw);
+        assert_eq!(event.role, Some("user".to_string()));
+        assert_eq!(event.summary, "[Image]");
+    }
+
+    #[test]
+    fn test_build_codex_timeline_event_message_concatenates_text_blocks() {
+        let raw = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "First chunk"},
+                    {"type": "output_text", "text": "Second chunk"}
+                ]
+            }
+        });
+        let event = build_codex_timeline_event(2, raw);
+        assert_eq!(event.role, Some("assistant".to_string()));
+        assert_eq!(event.summary, "First chunk\nSecond chunk");
+    }
+
+    #[test]
     fn test_build_codex_timeline_event_function_call() {
         let raw = serde_json::json!({
             "timestamp": "2026-01-01T00:00:02Z",
@@ -3660,5 +4074,95 @@ mod tests {
         assert_eq!(event.subtype, Some("function_call".to_string()));
         assert_eq!(event.tool_use_id, Some("call_abc123".to_string()));
         assert_eq!(event.operation, Some("shell_command".to_string()));
+    }
+
+    #[test]
+    fn test_build_codex_timeline_event_local_shell_call() {
+        let raw = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "local_shell_call",
+                "call_id": "call_local123",
+                "status": "completed",
+                "action": {
+                    "type": "exec",
+                    "command": "npm run test:ui"
+                }
+            }
+        });
+        let event = build_codex_timeline_event(3, raw);
+        assert_eq!(event.role, None);
+        assert_eq!(event.subtype, Some("local_shell_call".to_string()));
+        assert_eq!(event.tool_use_id, Some("call_local123".to_string()));
+        assert_eq!(event.operation, Some("local_shell_call".to_string()));
+        assert_eq!(event.summary, "completed npm run test:ui");
+    }
+
+    #[test]
+    fn test_build_codex_timeline_event_structured_function_output() {
+        let raw = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:03Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_abc123",
+                "output": {
+                    "content_items": [
+                        {"type": "output_text", "text": "first"},
+                        {"type": "output_text", "text": "second"}
+                    ]
+                }
+            }
+        });
+
+        let event = build_codex_timeline_event(4, raw);
+        assert_eq!(event.tool_use_id, Some("call_abc123".to_string()));
+        assert_eq!(event.summary, "first\nsecond");
+    }
+
+    #[test]
+    fn test_codex_legacy_ghost_snapshot_rollout_line_is_skipped() {
+        let raw = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "ghost_snapshot",
+                "ghost_commit": {
+                    "id": "deadbeef",
+                    "preexisting_untracked_dirs": [],
+                    "preexisting_untracked_files": []
+                }
+            }
+        });
+
+        assert_eq!(is_codex_legacy_ghost_snapshot_rollout_line(&raw), true);
+    }
+
+    #[test]
+    fn test_codex_token_count_metadata_uses_total_usage() {
+        let raw = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 40,
+                        "cached_input_tokens": 20,
+                        "reasoning_output_tokens": 7
+                    }
+                }
+            }
+        });
+
+        let mut accum = SessionMetadataAccumulator::default();
+        accumulate_codex_metadata(&mut accum, &raw);
+        let metadata = accum.build_metadata(None, None);
+
+        assert_eq!(metadata.total_input_tokens, 100);
+        assert_eq!(metadata.total_output_tokens, 40);
+        assert_eq!(metadata.total_cache_read_input_tokens, 20);
     }
 }

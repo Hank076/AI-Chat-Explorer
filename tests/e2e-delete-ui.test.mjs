@@ -75,6 +75,18 @@ function createMockInvoke(options = {}) {
       source: "codex",
     },
   ];
+  if (options.includeHiddenCodexEntries !== false) {
+    codexEntries.push({
+      entryType: "session",
+      label: "hidden-codex-session.jsonl",
+      path: "C:/Users/mock/.codex/sessions/2026/03/hidden-codex-session.jsonl",
+      parentSession: null,
+      modifiedMs: Date.now() - 3000,
+      sizeBytes: 80,
+      source: "codex",
+      hidden: true,
+    });
+  }
   const vscodeProjects = includeVscode
     ? [
         {
@@ -330,6 +342,321 @@ function createMockInvoke(options = {}) {
         },
       };
     }
+    if (cmd === "read_codex_session_timeline") {
+      return {
+        path: args.sessionPath,
+        errorCode: null,
+        errors: [],
+        events: [
+          {
+            line: 1,
+            timestamp: "2026-03-06T08:00:00Z",
+            role: "user",
+            eventType: "event_msg",
+            subtype: "user_message",
+            summary: "Plan this parser",
+            raw: {
+              timestamp: "2026-03-06T08:00:00Z",
+              type: "event_msg",
+              payload: {
+                type: "user_message",
+                message: "Plan this parser",
+              },
+            },
+          },
+          {
+            line: 11,
+            timestamp: "2026-03-06T08:00:00Z",
+            role: "user",
+            eventType: "response_item",
+            subtype: "message",
+            summary: "Plan this parser",
+            raw: {
+              timestamp: "2026-03-06T08:00:00Z",
+              type: "response_item",
+              payload: {
+                type: "message",
+                role: "user",
+                content: [
+                  { type: "input_text", text: "Plan this parser" },
+                ],
+              },
+            },
+          },
+          {
+            line: 12,
+            timestamp: "2026-03-06T08:00:01Z",
+            role: "user",
+            eventType: "response_item",
+            subtype: "message",
+            summary: "contextual user fragments",
+            raw: {
+              timestamp: "2026-03-06T08:00:01Z",
+              type: "response_item",
+              payload: {
+                type: "message",
+                role: "user",
+                content: [
+                  {
+                    type: "input_text",
+                    text: "# AGENTS.md instructions for D:\\Hank\\Dropbox\\AI-Project\\Unified-AI-Session-Explorer\n\n<INSTRUCTIONS>TXT</INSTRUCTIONS>",
+                  },
+                  {
+                    type: "input_text",
+                    text: "<environment_context>\n  <cwd>D:\\Hank\\Dropbox\\AI-Project\\Unified-AI-Session-Explorer</cwd>\n  <shell>powershell</shell>\n</environment_context>",
+                  },
+                ],
+              },
+            },
+          },
+          {
+            line: 2,
+            timestamp: "2026-03-06T08:00:03Z",
+            role: "assistant",
+            eventType: "event_msg",
+            subtype: "agent_message",
+            summary: "Use response_item for full content",
+            raw: {
+              timestamp: "2026-03-06T08:00:03Z",
+              type: "event_msg",
+              payload: {
+                type: "agent_message",
+                message: "Use response_item for full content",
+              },
+            },
+          },
+          {
+            line: 21,
+            timestamp: "2026-03-06T08:00:03Z",
+            role: "assistant",
+            eventType: "response_item",
+            subtype: "message",
+            summary: "Use response_item for full content",
+            raw: {
+              timestamp: "2026-03-06T08:00:03Z",
+              type: "response_item",
+              payload: {
+                type: "message",
+                role: "assistant",
+                content: [
+                  { type: "output_text", text: "Use response_item for full content" },
+                ],
+              },
+            },
+          },
+          {
+            line: 3,
+            timestamp: "2026-03-06T08:00:04Z",
+            role: "user",
+            eventType: "event_msg",
+            subtype: "user_message",
+            summary: "[Image]",
+            raw: {
+              timestamp: "2026-03-06T08:00:04Z",
+              type: "event_msg",
+              payload: {
+                type: "user_message",
+                message: "",
+                local_images: [{ path: "C:/tmp/screenshot.png" }],
+              },
+            },
+          },
+          {
+            line: 4,
+            timestamp: "2026-03-06T08:00:05Z",
+            role: "assistant",
+            eventType: "response_item",
+            subtype: "message",
+            summary: "First chunk\nSecond chunk",
+            raw: {
+              timestamp: "2026-03-06T08:00:05Z",
+              type: "response_item",
+              payload: {
+                type: "message",
+                role: "assistant",
+                content: [
+                  { type: "output_text", text: "First chunk" },
+                  { type: "output_text", text: "Second chunk" },
+                ],
+              },
+            },
+          },
+          {
+            line: 5,
+            timestamp: "2026-03-06T08:00:06Z",
+            role: "assistant",
+            eventType: "event_msg",
+            subtype: "agent_reasoning",
+            summary: "Consider rollout structure",
+            raw: {
+              timestamp: "2026-03-06T08:00:06Z",
+              type: "event_msg",
+              payload: {
+                type: "agent_reasoning",
+                text: "Consider rollout structure",
+              },
+            },
+          },
+          {
+            line: 53,
+            timestamp: "2026-03-06T08:00:06Z",
+            role: "assistant",
+            eventType: "event_msg",
+            subtype: "agent_reasoning_raw_content",
+            summary: "Raw reasoning stream",
+            raw: {
+              timestamp: "2026-03-06T08:00:06Z",
+              type: "event_msg",
+              payload: {
+                type: "agent_reasoning_raw_content",
+                text: "Raw reasoning stream",
+              },
+            },
+          },
+          {
+            line: 51,
+            timestamp: "2026-03-06T08:00:06Z",
+            role: "assistant",
+            eventType: "event_msg",
+            subtype: "agent_message",
+            summary: "I will inspect the rollout parser.",
+            raw: {
+              timestamp: "2026-03-06T08:00:06Z",
+              type: "event_msg",
+              payload: {
+                type: "agent_message",
+                message: "I will inspect the rollout parser.",
+                phase: "commentary",
+              },
+            },
+          },
+          {
+            line: 54,
+            timestamp: "2026-03-06T08:00:06Z",
+            role: "user",
+            eventType: "response_item",
+            subtype: "message",
+            summary: "<goal_context>Keep rollout display tidy</goal_context>",
+            raw: {
+              timestamp: "2026-03-06T08:00:06Z",
+              type: "response_item",
+              payload: {
+                type: "message",
+                role: "user",
+                content: [
+                  { type: "input_text", text: "<goal_context>Keep rollout display tidy</goal_context>" },
+                ],
+              },
+            },
+          },
+          {
+            line: 55,
+            timestamp: "2026-03-06T08:00:06Z",
+            role: null,
+            eventType: "response_item",
+            subtype: "message",
+            summary: "<developer_instructions>Switch model guidance</developer_instructions>",
+            raw: {
+              timestamp: "2026-03-06T08:00:06Z",
+              type: "response_item",
+              payload: {
+                type: "message",
+                role: "developer",
+                content: [
+                  { type: "input_text", text: "<developer_instructions>Switch model guidance</developer_instructions>" },
+                ],
+              },
+            },
+          },
+          {
+            line: 56,
+            timestamp: "2026-03-06T08:00:06Z",
+            role: null,
+            eventType: "response_item",
+            subtype: "local_shell_call",
+            summary: "shell command",
+            raw: {
+              timestamp: "2026-03-06T08:00:06Z",
+              type: "response_item",
+              payload: {
+                type: "local_shell_call",
+                call_id: "local_shell_1",
+                status: "completed",
+                action: {
+                  type: "exec",
+                  command: "npm run test:ui",
+                },
+              },
+            },
+          },
+          {
+            line: 52,
+            timestamp: "2026-03-06T08:00:06Z",
+            role: "assistant",
+            eventType: "response_item",
+            subtype: "reasoning",
+            summary: "",
+            raw: {
+              timestamp: "2026-03-06T08:00:06Z",
+              type: "response_item",
+              payload: {
+                type: "reasoning",
+                encrypted_content: "encrypted",
+              },
+            },
+          },
+          {
+            line: 6,
+            timestamp: "2026-03-06T08:00:07Z",
+            role: null,
+            eventType: "response_item",
+            subtype: "function_call",
+            toolUseId: "call_structured",
+            operation: "shell_command",
+            summary: "shell_command {}",
+            raw: {
+              timestamp: "2026-03-06T08:00:07Z",
+              type: "response_item",
+              payload: {
+                type: "function_call",
+                name: "shell_command",
+                arguments: "{\"command\":\"pwd\"}",
+                call_id: "call_structured",
+              },
+            },
+          },
+          {
+            line: 7,
+            timestamp: "2026-03-06T08:00:08Z",
+            role: null,
+            eventType: "response_item",
+            subtype: "function_call_output",
+            toolUseId: "call_structured",
+            summary: "D:/repo/demo",
+            raw: {
+              timestamp: "2026-03-06T08:00:08Z",
+              type: "response_item",
+              payload: {
+                type: "function_call_output",
+                call_id: "call_structured",
+                output: {
+                  content_items: [
+                    { type: "output_text", text: "D:/repo/demo" },
+                  ],
+                },
+              },
+            },
+          },
+        ],
+        metadata: {
+          modelName: "gpt-5.4",
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          startTime: "2026-03-06T08:00:00Z",
+          endTime: "2026-03-06T08:00:03Z",
+        },
+      };
+    }
     if (cmd === "read_memory") {
       return { path: args.memoryPath, content: "mock-memory" };
     }
@@ -576,6 +903,82 @@ test("vscode copilot projects list entries and render timelines", async () => {
 
   assert.equal(window.document.querySelector("#source-toggle-vscode").getAttribute("aria-pressed"), "false");
   assert.equal(window.document.querySelector(".project-btn"), null);
+  app.cleanup();
+});
+
+test("codex event_msg user and agent messages render as chat bubbles", async () => {
+  const app = await setupApp();
+  const { window, mock } = app;
+
+  const projectButton = window.document.querySelector(".project-btn");
+  assert.ok(projectButton);
+  projectButton.click();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const codexEntryButton = window.document.querySelector('.entry-btn[title="codex-session.jsonl"]');
+  assert.ok(codexEntryButton, "Codex entry should exist");
+  assert.equal(
+    window.document.querySelector('.entry-btn[title="hidden-codex-session.jsonl"]'),
+    null,
+    "hidden Codex entry should be hidden by default",
+  );
+  assert.equal(
+    window.document.querySelector(".entries-show-hidden-toggle"),
+    null,
+    "FILES title should not include show hidden checkbox",
+  );
+  codexEntryButton.click();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(
+    mock.calls.some((call) => call.cmd === "read_codex_session_timeline"),
+    true,
+  );
+  const chatTexts = [...window.document.querySelectorAll(".user-msg-text, .assist-text")]
+    .map((node) => (node.textContent || "").trim())
+    .filter(Boolean);
+  assert.ok(chatTexts.includes("Plan this parser"));
+  assert.equal(chatTexts.filter((text) => text === "Plan this parser").length, 1);
+  assert.equal(chatTexts.some((text) => text.includes("AGENTS.md instructions")), false);
+  assert.equal(chatTexts.some((text) => text.includes("<environment_context>")), false);
+  assert.ok(chatTexts.includes("Use response_item for full content"));
+  assert.ok(chatTexts.includes("[Image]"));
+  assert.ok(chatTexts.includes("First chunk\nSecond chunk"));
+  assert.equal(
+    chatTexts.filter((text) => text === "Use response_item for full content").length,
+    1,
+  );
+  assert.equal(chatTexts.includes("I will inspect the rollout parser."), false);
+
+  window.document.querySelector("#hide-thinking-events-toggle").click();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const thinkingTexts = [...window.document.querySelectorAll(".assistant-thinking-text")]
+    .map((node) => (node.textContent || "").trim());
+  assert.ok(thinkingTexts.includes("Consider rollout structure"));
+  assert.ok(thinkingTexts.includes("Raw reasoning stream"));
+  assert.ok(thinkingTexts.includes("I will inspect the rollout parser."));
+  assert.equal(
+    thinkingTexts.filter((text) => text === "I will inspect the rollout parser.").length,
+    1,
+  );
+  assert.equal(
+    thinkingTexts.some((text) => /encrypted|已加密/i.test(text)),
+    false,
+  );
+  window.document.querySelector("#hide-tool-events-toggle").click();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const toolLines = [...window.document.querySelectorAll(".assistant-tool-line")]
+    .map((node) => (node.textContent || "").trim());
+  assert.ok(toolLines.includes("D:/repo/demo"));
+  window.document.querySelector("#hide-system-events-toggle").click();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const techHeaders = [...window.document.querySelectorAll(".tool-hdr-txt")]
+    .map((node) => (node.textContent || "").trim());
+  assert.ok(techHeaders.some((text) => /contextual_user_fragments/i.test(text)));
+  assert.ok(techHeaders.some((text) => /developer_message/i.test(text)));
+  assert.ok(techHeaders.some((text) => /local_shell_call/i.test(text)));
+  assert.equal(chatTexts.some((text) => text.includes("<goal_context>")), false);
+
   app.cleanup();
 });
 

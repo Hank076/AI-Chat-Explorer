@@ -1363,10 +1363,11 @@ function renderEntries() {
   const allSessionEntries = state.entries
     .filter((entry) => entry.entryType === "session")
     .sort((a, b) => (b.modifiedMs || 0) - (a.modifiedMs || 0));
+  const visibleSessionEntries = allSessionEntries.filter((entry) => entry.hidden !== true);
 
   const dateFilteredEntries = state.entryDateFilter !== "all"
-    ? allSessionEntries.filter((e) => isEntryInDateFilter(e.modifiedMs, state.entryDateFilter))
-    : allSessionEntries;
+    ? visibleSessionEntries.filter((e) => isEntryInDateFilter(e.modifiedMs, state.entryDateFilter))
+    : visibleSessionEntries;
 
   const searchResults = state.entrySearchResults;
   const isSearchFiltering = searchResults !== null && !state.isSearchingEntries;
@@ -1497,7 +1498,9 @@ function createEntriesSectionTitle(title, count, iconName = "") {
   if (icon) headingWrap.appendChild(icon);
   headingWrap.append(createElement("span", "entries-section-heading", title));
   const badge = createElement("span", "entries-section-badge", String(count));
-  item.append(headingWrap, badge);
+  const right = createElement("span", "entries-section-actions");
+  right.appendChild(badge);
+  item.append(headingWrap, right);
   return item;
 }
 
@@ -2498,6 +2501,20 @@ function buildTechSummary(event) {
     return { subtype: payloadType, summary: tt("tech.codexEvent", { subtype: payloadType }) };
   }
 
+  if (rawType === "response_item") {
+    const payloadType = raw.payload?.type || "unknown";
+    const role = raw.payload?.role || "";
+    if (payloadType === "message" && role === "developer") {
+      return { subtype: "developer_message", summary: tt("tech.codexEvent", { subtype: "developer_message" }) };
+    }
+    if (payloadType === "local_shell_call") {
+      const status = raw.payload?.status || "unknown";
+      const command = raw.payload?.action?.command || raw.payload?.action?.cmd || "";
+      const suffix = command ? `: ${command}` : "";
+      return { subtype: payloadType, summary: `${tt("tech.codexEvent", { subtype: payloadType })} (${status})${suffix}` };
+    }
+  }
+
   if (rawType === "progress") {
     const dataType = raw.data?.type || "progress";
     if (dataType === "hook_progress") {
@@ -2560,6 +2577,10 @@ function getCodexChatRole(raw) {
   if (!raw || typeof raw !== "object") return null;
   const outerType = raw.type;
   const payloadType = raw.payload?.type;
+  if (outerType === "event_msg") {
+    if (payloadType === "user_message") return "user";
+    if (payloadType === "agent_message") return "assistant";
+  }
   if (outerType === "response_item" && payloadType === "message") {
     const r = raw.payload?.role;
     if (r === "user" || r === "assistant") return r;
@@ -2573,23 +2594,70 @@ function extractCodexChatText(raw) {
   const payload = raw.payload;
   if (!payload) return "";
   if (outerType === "event_msg" && (payloadType === "user_message" || payloadType === "agent_message")) {
-    return String(payload.message || "");
+    const message = String(payload.message || "");
+    if (message.trim()) return message;
+    const hasImages =
+      (Array.isArray(payload.images) && payload.images.length > 0) ||
+      (Array.isArray(payload.local_images) && payload.local_images.length > 0);
+    return hasImages ? "[Image]" : "";
   }
   if (outerType === "response_item" && payloadType === "message") {
     const content = payload.content;
     if (Array.isArray(content)) {
-      const textItem = content.find(
-        (item) => item?.type === "output_text" || item?.type === "input_text" || item?.type === "text",
-      );
-      return String(textItem?.text || "");
+      return content
+        .filter((item) => item?.type === "output_text" || item?.type === "input_text" || item?.type === "text")
+        .map((item) => String(item?.text || ""))
+        .filter((text) => text.length > 0)
+        .join("\n");
     }
   }
   return "";
 }
 
+function isCodexCommentaryMessage(raw) {
+  if (!raw || typeof raw !== "object") return false;
+  const phase = raw.payload?.phase;
+  if (phase !== "commentary") return false;
+  if (raw.type === "event_msg" && raw.payload?.type === "agent_message") return true;
+  return raw.type === "response_item" && raw.payload?.type === "message" && raw.payload?.role === "assistant";
+}
+
+function isCodexContextualUserMessage(raw) {
+  if (!raw || typeof raw !== "object") return false;
+  if (raw.type !== "response_item" || raw.payload?.type !== "message" || raw.payload?.role !== "user") {
+    return false;
+  }
+  const text = extractCodexChatText(raw);
+  return (
+    text.includes("# AGENTS.md instructions for") ||
+    /<(environment_context|skill_instructions|user_shell_command|turn_aborted|subagent_notification|goal_context|legacy_unified_exec_process_limit_warning|legacy_apply_patch_exec_command_warning|legacy_model_mismatch_warning)\b/i.test(text)
+  );
+}
+
 function isCodexThinkingEvent(raw) {
   if (!raw || typeof raw !== "object") return false;
-  return raw.type === "response_item" && raw.payload?.type === "reasoning";
+  return (
+    (raw.type === "event_msg" &&
+      (raw.payload?.type === "agent_reasoning" || raw.payload?.type === "agent_reasoning_raw_content")) ||
+    (raw.type === "response_item" && raw.payload?.type === "reasoning")
+  );
+}
+
+function extractCodexThinkingText(raw) {
+  if (
+    raw?.type === "event_msg" &&
+    (raw.payload?.type === "agent_reasoning" || raw.payload?.type === "agent_reasoning_raw_content")
+  ) {
+    return String(raw.payload?.text || raw.payload?.content || raw.payload?.delta || "").trim();
+  }
+  const summary = raw?.payload?.summary;
+  if (Array.isArray(summary)) {
+    return summary
+      .map((item) => String(item?.text || "").trim())
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
 }
 
 function buildCodexTokenCountSummary(payload) {
@@ -2677,12 +2745,32 @@ function buildCodexFunctionCallDetail(payload) {
   };
 }
 
+function extractCodexStructuredText(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => extractCodexStructuredText(item))
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (value && typeof value === "object") {
+    const direct = typeof value.text === "string" ? value.text : "";
+    if (direct) return direct;
+    const content = extractCodexStructuredText(value.content);
+    if (content) return content;
+    const contentItems = extractCodexStructuredText(value.content_items);
+    if (contentItems) return contentItems;
+  }
+  return "";
+}
+
 function normalizeEvents(events) {
   const normalized = [];
   const toolResultsMap = new Map();
   const consumedResultIds = new Set();
   const localCommandStdoutMap = new Map();
   const codexFunctionOutputMap = new Map();
+  const codexEventMessageKeys = new Set();
 
   // 第一階段：預掃描所有 tool_result 與 local-command-stdout 關聯
   for (const event of events) {
@@ -2709,6 +2797,11 @@ function normalizeEvents(events) {
       } else {
         localCommandStdoutMap.set(parentUuid, localCommandStdout);
       }
+    }
+    if (raw.type === "event_msg" && (raw.payload?.type === "user_message" || raw.payload?.type === "agent_message")) {
+      const role = raw.payload?.type === "user_message" ? "user" : "assistant";
+      const text = extractCodexChatText(raw).trim();
+      if (text) codexEventMessageKeys.add(`${role}\n${text}`);
     }
     // 預掃描 Codex function_call_output / custom_tool_call_output，以 call_id 建立 map
     if (raw.type === "response_item") {
@@ -2815,6 +2908,48 @@ function normalizeEvents(events) {
       // Codex events: extract text directly from payload
       if (codexRole !== null) {
         const codexText = extractCodexChatText(raw);
+        if (isCodexContextualUserMessage(raw)) {
+          normalized.push({
+            kind: "tech",
+            line: event.line,
+            timestamp: event.timestamp,
+            title: rawType,
+            summary: "contextual user fragments",
+            techSubtype: "contextual_user_fragments",
+            raw,
+          });
+          continue;
+        }
+        if (
+          raw.type === "response_item" &&
+          (raw.payload?.role === "user" || raw.payload?.role === "assistant") &&
+          codexText.trim() &&
+          codexEventMessageKeys.has(`${raw.payload.role}\n${codexText.trim()}`)
+        ) {
+          continue;
+        }
+        if (isCodexCommentaryMessage(raw)) {
+          const thinkingDetails = codexText.trim() ? [codexText] : [];
+          if (thinkingDetails.length === 0) continue;
+          normalized.push({
+            kind: "chat_assistant",
+            source: "codex",
+            requestId: event.requestId || raw.requestId || "",
+            line: event.line,
+            timestamp: event.timestamp,
+            title: tt("chat.codex"),
+            headerModel: "",
+            summary: "",
+            conversationSummary: "",
+            conversationToolSummary: "",
+            tags: ["thinking"],
+            thinkingDetails,
+            toolUseDetails: [],
+            toolResultDetails: [],
+            raw,
+          });
+          continue;
+        }
         normalized.push({
           kind: roleType === "user" ? "chat_user" : "chat_assistant",
           source: "codex",
@@ -2877,6 +3012,8 @@ function normalizeEvents(events) {
 
     // Codex thinking events → show as assistant bubble with encrypted notice
     if (isCodexThinkingEvent(raw)) {
+      const thinkingText = extractCodexThinkingText(raw);
+      if (!thinkingText) continue;
       normalized.push({
         kind: "chat_assistant",
         source: "codex",
@@ -2889,7 +3026,7 @@ function normalizeEvents(events) {
         conversationSummary: "",
         conversationToolSummary: "",
         tags: ["thinking"],
-        thinkingDetails: [tt("codex.thinking.encrypted")],
+        thinkingDetails: [thinkingText],
         toolUseDetails: [],
         toolResultDetails: [],
         raw,
@@ -2907,7 +3044,7 @@ function normalizeEvents(events) {
         const toolName = String(raw.payload?.name || "unknown");
         const toolResultDetails = [];
         if (outputPayload) {
-          const outputText = String(outputPayload.output || "").trim();
+          const outputText = extractCodexStructuredText(outputPayload.output).trim();
           if (outputText) {
             toolResultDetails.push({
               title: tt("tool.result.title", { index: 1 }),
