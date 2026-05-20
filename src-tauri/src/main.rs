@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    unified_ai_session_explorer_lib::run()
+    ai_chat_explorer_lib::run()
 }

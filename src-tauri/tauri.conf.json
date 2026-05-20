@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Unified AI Session Explorer",
-  "version": "0.3.1",
-  "identifier": "com.hankchen.unifiedaisessionexplorer",
+  "productName": "AI Chat Explorer",
+  "version": "0.4.0",
+  "identifier": "com.hankchen.aichatexplorer",
   "build": {
     "beforeDevCommand": "npm run dev:web",
     "devUrl": "http://127.0.0.1:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Unified AI Session Explorer",
+        "title": "AI Chat Explorer",
         "center": true,
         "width": 1320,
         "height": 860,

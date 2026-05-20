@@ -1,5 +1,5 @@
 export default {
-  "app.name": "Unified AI Session Explorer",
+  "app.name": "AI Chat Explorer",
   "app.subtitle": "瀏覽 AI 的歷史對話與 Memory",
   "panel.projects": "專案",
   "project.searchPlaceholder": "搜尋專案...",

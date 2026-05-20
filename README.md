@@ -1,8 +1,8 @@
-# Unified AI Session Explorer
+# AI Chat Explorer
 
 Languages: [English](./README.md) | [繁體中文](./README.zh-Hant.md)
 
-Unified AI Session Explorer is a local-first desktop app built with Tauri 2, Rust, and vanilla JavaScript for browsing AI session history. It currently supports **Claude** (`~/.claude/projects`), **Codex CLI** (`~/.codex`), and **VS Code / GitHub Copilot Chat** workspace chat sessions.
+AI Chat Explorer is a local-first desktop app built with Tauri 2, Rust, and vanilla JavaScript for browsing AI chat history. It currently supports **Claude** (`~/.claude/projects`), **Codex CLI** (`~/.codex`), and **VS Code / GitHub Copilot Chat** workspace chat sessions.
 
 It is designed for people who want a faster and safer way to inspect local AI workspaces without uploading session data to a third-party service.
 
@@ -10,7 +10,7 @@ It is designed for people who want a faster and safer way to inspect local AI wo
 
 - Local-first by default. Session data stays on your machine.
 - Supports multiple AI sources: **Claude**, **Codex CLI**, and **VS Code / GitHub Copilot Chat**, with a source toggle to filter by provider.
-- Rust backend for directory traversal, JSONL parsing, and path validation.
+- Rust backend for source discovery, JSON/JSONL parsing, rollout replay, and path validation.
 - Timeline viewer for conversations, tool activity, thinking blocks, and system events.
 - Tree view for parent sessions and subagent sessions.
 - Built-in project and message search.
@@ -29,6 +29,7 @@ It is designed for people who want a faster and safer way to inspect local AI wo
 - Open sessions and memory files from the same project workspace.
 - Display session metadata including model, token usage, web tool usage, and estimated duration.
 - Render Codex session timelines including chat messages, thinking blocks, function calls, and system events.
+- Replay Codex rollout records so `event_msg` user and assistant messages render as normal chat bubbles.
 - Render VS Code / GitHub Copilot Chat timelines from `.json` and `.jsonl` session records.
 - Keep `tool_use` and `tool_result` content grouped in a readable timeline.
 - Toggle visibility for system events, tool calls, and thinking content independently.
@@ -111,11 +112,13 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 ## 🔒 Security Model
 
-- The backend validates requested paths and rejects access outside the configured Claude projects root.
-- The default data root is `%USERPROFILE%\\.claude\\projects` on Windows and `~/.claude/projects` on Unix-like systems.
+- The backend validates requested paths against the allowed root for each source before reading, parsing, or deleting.
+- Claude sessions are discovered from `%USERPROFILE%\\.claude\\projects` on Windows and `~/.claude/projects` on Unix-like systems.
+- Codex CLI sessions are discovered from `~/.codex`.
 - VS Code / GitHub Copilot Chat records are discovered from VS Code workspace storage and are treated as read-only in the current UI.
-- Project deletion removes the full project directory tree.
-- Session deletion removes the selected `.jsonl` file and its related subagent directory when present.
+- Claude project deletion removes the full project directory tree.
+- Codex project deletion removes matching Codex session files for that project.
+- Session deletion is source-specific and only exposed for sources with backend deletion support.
 
 ## 🤝 Contributing
 
