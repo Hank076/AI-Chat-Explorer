@@ -1004,6 +1004,13 @@ fn has_jsonl_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn has_json_or_jsonl_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("jsonl"))
+        .unwrap_or(false)
+}
+
 fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     for item in fs::read_dir(dir).map_err(map_read_error)? {
         let item = item.map_err(map_read_error)?;
@@ -1074,6 +1081,1025 @@ fn get_file_metadata(path: &Path) -> (Option<u64>, Option<u64>) {
         .and_then(|duration| u64::try_from(duration.as_millis()).ok());
 
     (modified_ms, size)
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3]) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    decoded.push(byte);
+                    index += 3;
+                    continue;
+                }
+            }
+        }
+
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8_lossy(&decoded).to_string()
+}
+
+fn decode_vscode_workspace_folder_uri(uri: &str) -> Option<String> {
+    let path = percent_decode(uri.trim().strip_prefix("file://")?);
+    let bytes = path.as_bytes();
+
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b':' && bytes[1].is_ascii_alphabetic() {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        let rest = path[3..].trim_start_matches('/').replace('/', r"\");
+        return Some(format!("{drive}:\\{rest}"));
+    }
+
+    Some(path)
+}
+
+fn latest_modified_ms_in_dir(dir: &Path) -> Option<u64> {
+    let mut latest = None;
+    let entries = fs::read_dir(dir).ok()?;
+
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let modified_ms = get_file_metadata(&entry.path()).0;
+        if modified_ms > latest {
+            latest = modified_ms;
+        }
+    }
+
+    latest
+}
+
+fn list_vscode_copilot_projects_from_root(root: &Path) -> Result<Vec<Project>, String> {
+    if !root.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut projects = Vec::new();
+    for item in fs::read_dir(root).map_err(map_read_error)? {
+        let Ok(item) = item else {
+            continue;
+        };
+        let Ok(file_type) = item.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let workspace = item.path();
+        let chat_sessions = workspace.join("chatSessions");
+        if !chat_sessions.is_dir() {
+            continue;
+        }
+
+        let workspace_json = workspace.join("workspace.json");
+        let Ok(content) = fs::read_to_string(workspace_json) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        let Some(cwd_path) = value
+            .get("folder")
+            .and_then(|folder| folder.as_str())
+            .and_then(decode_vscode_workspace_folder_uri)
+        else {
+            continue;
+        };
+
+        let name = project_name_from_cwd(&cwd_path).unwrap_or_else(|| item.file_name().to_string_lossy().to_string());
+        projects.push(Project {
+            name,
+            path: cwd_path.clone(),
+            cwd_path: Some(cwd_path),
+            modified_ms: latest_modified_ms_in_dir(&chat_sessions),
+            source: "vscode".to_string(),
+        });
+    }
+
+    projects.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    Ok(projects)
+}
+
+fn default_vscode_workspace_storage_path() -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| ERR_READ_FAILED.to_string())?;
+        Ok(appdata.join("Code").join("User").join("workspaceStorage"))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| ERR_READ_FAILED.to_string())?;
+        Ok(home
+            .join("Library")
+            .join("Application Support")
+            .join("Code")
+            .join("User")
+            .join("workspaceStorage"))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| ERR_READ_FAILED.to_string())?;
+        Ok(home.join(".config").join("Code").join("User").join("workspaceStorage"))
+    }
+}
+
+fn find_vscode_workspace_hash_for_cwd(root: &Path, cwd: &str) -> Result<String, String> {
+    if !root.exists() {
+        return Err(ERR_NOT_FOUND.to_string());
+    }
+
+    let target = normalize_cwd_for_comparison(cwd);
+    for item in fs::read_dir(root).map_err(map_read_error)? {
+        let Ok(item) = item else {
+            continue;
+        };
+        let Ok(file_type) = item.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let workspace_json = item.path().join("workspace.json");
+        let Ok(content) = fs::read_to_string(workspace_json) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        let Some(workspace_cwd) = value
+            .get("folder")
+            .and_then(|folder| folder.as_str())
+            .and_then(decode_vscode_workspace_folder_uri)
+        else {
+            continue;
+        };
+
+        if normalize_cwd_for_comparison(&workspace_cwd) == target {
+            return Ok(item.file_name().to_string_lossy().to_string());
+        }
+    }
+
+    Err(ERR_NOT_FOUND.to_string())
+}
+
+fn list_vscode_copilot_project_entries_from_root(
+    cwd: &str,
+    root: &Path,
+) -> Result<Vec<Entry>, String> {
+    let workspace_hash = find_vscode_workspace_hash_for_cwd(root, cwd)?;
+    let workspace = root.join(workspace_hash);
+    let chat_sessions = workspace.join("chatSessions");
+    let Ok(canonical_workspace) = workspace.canonicalize() else {
+        return Ok(vec![]);
+    };
+    let Ok(canonical_chat_sessions) = chat_sessions.canonicalize() else {
+        return Ok(vec![]);
+    };
+    if !canonical_chat_sessions.starts_with(&canonical_workspace) {
+        return Ok(vec![]);
+    }
+
+    let mut entries = Vec::new();
+    for item in fs::read_dir(chat_sessions).map_err(map_read_error)? {
+        let Ok(item) = item else {
+            continue;
+        };
+        let Ok(file_type) = item.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let file = item.path();
+        if !has_json_or_jsonl_extension(&file) {
+            continue;
+        }
+        if !vscode_copilot_session_has_visible_timeline(&file) {
+            continue;
+        }
+
+        let label = file_name_or(&file, "session");
+        entries.push(build_entry("session", &file, label, None, "vscode"));
+    }
+
+    entries.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    Ok(entries)
+}
+
+fn vscode_copilot_session_has_visible_timeline(path: &Path) -> bool {
+    read_vscode_copilot_session_timeline_from_path(path)
+        .map(|payload| !payload.events.is_empty())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+pub fn list_vscode_copilot_projects(base_path: Option<String>) -> Result<Vec<Project>, String> {
+    let root = match base_path {
+        Some(path) => PathBuf::from(path),
+        None => default_vscode_workspace_storage_path()?,
+    };
+    list_vscode_copilot_projects_from_root(&root)
+}
+
+#[tauri::command]
+pub fn list_vscode_copilot_project_entries(
+    cwd: String,
+    base_path: Option<String>,
+) -> Result<Vec<Entry>, String> {
+    let root = match base_path {
+        Some(path) => PathBuf::from(path),
+        None => default_vscode_workspace_storage_path()?,
+    };
+    if !root.exists() {
+        return Ok(vec![]);
+    }
+    match list_vscode_copilot_project_entries_from_root(&cwd, &root) {
+        Ok(entries) => Ok(entries),
+        Err(error) if error == ERR_NOT_FOUND => Ok(vec![]),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_vscode_copilot_state_json(path: &Path) -> Result<(Value, Vec<ParseError>), String> {
+    let content = fs::read_to_string(path).map_err(map_read_error)?;
+    let state = serde_json::from_str::<Value>(&content).map_err(|_| ERR_READ_FAILED.to_string())?;
+    Ok((state, Vec::new()))
+}
+
+fn read_vscode_copilot_state_jsonl(path: &Path) -> Result<(Value, Vec<ParseError>), String> {
+    let content = fs::read_to_string(path).map_err(map_read_error)?;
+    let mut state = Value::Object(serde_json::Map::new());
+    let mut errors = Vec::new();
+    let mut parsed_entries = Vec::new();
+
+    for (index, line) in content.lines().enumerate() {
+        let line_number = index + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            errors.push(ParseError {
+                line: line_number,
+                message: "invalid json".to_string(),
+            });
+            continue;
+        };
+
+        parsed_entries.push(value.clone());
+
+        if line_number == 1 {
+            if let Some(initial_state) = value.get("v") {
+                state = initial_state.clone();
+            }
+            continue;
+        }
+
+        let Some(path) = value.get("k").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let Some(patch_value) = value.get("v") else {
+            continue;
+        };
+        let kind = value.get("kind").and_then(|v| v.as_i64());
+        let insert_index = value
+            .get("i")
+            .and_then(|v| v.as_u64())
+            .and_then(|value| usize::try_from(value).ok());
+        apply_vscode_state_patch(&mut state, path, patch_value.clone(), kind, insert_index);
+    }
+
+    if parsed_entries.iter().any(is_vscode_agent_event) {
+        return Ok((serde_json::json!({ "events": parsed_entries }), errors));
+    }
+
+    Ok((state, errors))
+}
+
+fn is_vscode_agent_event(value: &Value) -> bool {
+    matches!(
+        value.get("type").and_then(|v| v.as_str()),
+        Some(
+            "user.message"
+                | "assistant.message"
+                | "assistant.message_delta"
+                | "assistant.usage"
+                | "session.model_change"
+        )
+    )
+}
+
+fn get_vscode_patch_target_mut<'a>(state: &'a mut Value, path: &[Value]) -> Option<&'a mut Value> {
+    let mut current = state;
+    for segment in path {
+        if let Some(key) = segment.as_str() {
+            current = current.get_mut(key)?;
+        } else if let Some(index) = segment.as_u64().and_then(|value| usize::try_from(value).ok()) {
+            current = current.get_mut(index)?;
+        } else {
+            return None;
+        }
+    }
+    Some(current)
+}
+
+fn apply_vscode_state_patch(
+    state: &mut Value,
+    path: &[Value],
+    patch_value: Value,
+    kind: Option<i64>,
+    insert_index: Option<usize>,
+) {
+    if path.is_empty() {
+        *state = patch_value;
+        return;
+    }
+
+    if kind == Some(2) {
+        if let Some(items) = patch_value.as_array() {
+            if let Some(target) =
+                get_vscode_patch_target_mut(state, path).and_then(|value| value.as_array_mut())
+            {
+                let index = insert_index.unwrap_or(target.len());
+                if index <= target.len() {
+                    target.splice(index..index, items.clone());
+                    return;
+                }
+            }
+        }
+    }
+
+    let mut current = state;
+    for segment in &path[..path.len() - 1] {
+        if let Some(key) = segment.as_str() {
+            let Some(next) = current.get_mut(key) else {
+                return;
+            };
+            current = next;
+        } else if let Some(index) = segment.as_u64().and_then(|value| usize::try_from(value).ok()) {
+            let Some(next) = current.get_mut(index) else {
+                return;
+            };
+            current = next;
+        } else {
+            return;
+        }
+    }
+
+    let last = &path[path.len() - 1];
+    if let Some(key) = last.as_str() {
+        if let Some(object) = current.as_object_mut() {
+            object.insert(key.to_string(), patch_value);
+        }
+    } else if let Some(index) = last.as_u64().and_then(|value| usize::try_from(value).ok()) {
+        if let Some(array) = current.as_array_mut() {
+            if index < array.len() {
+                array[index] = patch_value;
+            } else if index == array.len() {
+                array.push(patch_value);
+            }
+        }
+    }
+}
+
+fn vscode_value_to_string(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    if value.is_number() || value.is_boolean() {
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn extract_vscode_message_text(message: &Value) -> Option<String> {
+    if let Some(text) = message.get("text").and_then(|v| v.as_str()) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let parts = message.get("parts").and_then(|v| v.as_array())?;
+    let text = parts
+        .iter()
+        .filter_map(|part| part.get("text").and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn extract_vscode_response_value_text(item: &Value) -> Option<&str> {
+    item.get("value")
+        .or_else(|| item.get("message"))
+        .or_else(|| item.get("markdownContent"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+fn vscode_tool_input_from_item(item: &Value, keys: &[&str]) -> Value {
+    let mut input = serde_json::Map::new();
+    for key in keys {
+        if let Some(value) = item.get(*key) {
+            input.insert((*key).to_string(), value.clone());
+        }
+    }
+    Value::Object(input)
+}
+
+fn vscode_file_change_input(item: &Value) -> Value {
+    let mut input = serde_json::Map::new();
+    if let Some(uri) = item.get("uri") {
+        input.insert("uri".to_string(), uri.clone());
+        if let Some(path) = uri.get("path").and_then(|v| v.as_str()) {
+            input.insert("file_path".to_string(), Value::String(path.to_string()));
+        } else if let Some(uri_text) = uri.as_str() {
+            input.insert("file_path".to_string(), Value::String(uri_text.to_string()));
+        }
+    }
+    if let Some(edits) = item.get("edits") {
+        input.insert("edits".to_string(), edits.clone());
+        if let Some(count) = edits.as_array().map(|items| items.len()) {
+            input.insert("edit_count".to_string(), serde_json::json!(count));
+        }
+    }
+    if let Some(done) = item.get("done") {
+        input.insert("done".to_string(), done.clone());
+    }
+    Value::Object(input)
+}
+
+fn vscode_response_item_to_content(item: &Value) -> Option<Value> {
+    let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+
+    if kind == "thinking" {
+        let text = extract_vscode_response_value_text(item)?;
+        return Some(serde_json::json!({
+            "type": "thinking",
+            "thinking": text,
+        }));
+    }
+
+    if kind == "toolInvocationSerialized" {
+        let tool_name = item
+            .get("toolId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("VSCodeTool");
+        let tool_id = item
+            .get("toolCallId")
+            .and_then(|v| v.as_str())
+            .unwrap_or(tool_name);
+        return Some(serde_json::json!({
+            "type": "tool_use",
+            "id": tool_id,
+            "name": tool_name,
+            "input": vscode_tool_input_from_item(
+                item,
+                &[
+                    "invocationMessage",
+                    "pastTenseMessage",
+                    "generatedTitle",
+                    "resultDetails",
+                    "toolSpecificData",
+                    "source",
+                    "presentation",
+                    "isComplete",
+                    "isConfirmed"
+                ],
+            ),
+        }));
+    }
+
+    if matches!(kind, "textEditGroup" | "workspaceEdit" | "codeblockUri") {
+        return Some(serde_json::json!({
+            "type": "tool_use",
+            "id": item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("vscode-file-change"),
+            "name": "VSCodeFileChange",
+            "input": vscode_file_change_input(item),
+        }));
+    }
+
+    if matches!(kind, "progressTaskSerialized" | "progressMessage" | "questionCarousel" | "elicitationSerialized") {
+        return Some(serde_json::json!({
+            "type": "tool_use",
+            "id": item
+                .get("resolveId")
+                .or_else(|| item.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("vscode-system"),
+            "name": "VSCodeSystem",
+            "input": item,
+        }));
+    }
+
+    extract_vscode_response_value_text(item).map(|text| {
+        serde_json::json!({
+            "type": "text",
+            "text": text,
+        })
+    })
+}
+
+fn extract_vscode_response_sections(response: &Value) -> (Option<String>, Vec<Value>) {
+    let Some(items) = response.as_array() else {
+        return (None, Vec::new());
+    };
+    let content = items
+        .iter()
+        .filter_map(vscode_response_item_to_content)
+        .collect::<Vec<_>>();
+    let text = content
+        .iter()
+        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("text"))
+        .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = if text.is_empty() { None } else { Some(text) };
+    (text, content)
+}
+
+fn build_vscode_assistant_raw_with_model(
+    content: Vec<Value>,
+    model: Option<&str>,
+    original: &Value,
+) -> Value {
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": content,
+    });
+    if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
+        if let Some(object) = message.as_object_mut() {
+            object.insert("model".to_string(), Value::String(model.to_string()));
+        }
+    }
+    serde_json::json!({
+        "type": "message",
+        "message": message,
+        "vscodeRaw": original,
+    })
+}
+
+fn build_vscode_turn_raw(
+    request_text: Option<&str>,
+    response_content: Vec<Value>,
+    response_model: Option<&str>,
+    original: &Value,
+) -> Value {
+    let request_raw = request_text.map(|text| {
+        serde_json::json!({
+            "type": "message",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": text,
+                }],
+            },
+            "vscodeRaw": original.get("message").unwrap_or(&Value::Null),
+        })
+    });
+    let response_raw = if response_content.is_empty() {
+        None
+    } else {
+        Some(build_vscode_assistant_raw_with_model(
+            response_content,
+            response_model,
+            original.get("response").unwrap_or(&Value::Null),
+        ))
+    };
+
+    serde_json::json!({
+        "type": "vscode_turn",
+        "vscodeTurn": {
+            "request": request_raw,
+            "response": response_raw,
+        },
+        "vscodeRaw": original,
+    })
+}
+
+fn extract_vscode_request_model(request: &Value) -> Option<String> {
+    [
+        ["result", "metadata", "resolvedModel"].as_slice(),
+        ["result", "details"].as_slice(),
+        ["modelId"].as_slice(),
+        ["model"].as_slice(),
+    ]
+    .iter()
+    .find_map(|path| {
+        let mut current = request;
+        for segment in *path {
+            current = current.get(*segment)?;
+        }
+        vscode_value_to_string(current).map(|value| {
+            value
+                .strip_prefix("copilot/")
+                .unwrap_or(value.as_str())
+                .to_string()
+        })
+    })
+}
+
+fn build_vscode_event_request_raw(text: &str, original: &Value, model: Option<&str>) -> Value {
+    let mut message = serde_json::json!({
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": text,
+        }],
+    });
+    if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
+        if let Some(object) = message.as_object_mut() {
+            object.insert("model".to_string(), Value::String(model.to_string()));
+        }
+    }
+    serde_json::json!({
+        "type": "message",
+        "message": message,
+        "vscodeRaw": original,
+    })
+}
+
+fn build_vscode_event_turn_raw(
+    request_raw: Option<Value>,
+    response_raw: Option<Value>,
+    originals: Vec<Value>,
+) -> Value {
+    serde_json::json!({
+        "type": "vscode_turn",
+        "vscodeTurn": {
+            "request": request_raw,
+            "response": response_raw,
+        },
+        "vscodeRaw": originals,
+    })
+}
+
+fn extract_vscode_agent_content_text(data: &Value) -> Option<String> {
+    if let Some(text) = data.get("content").and_then(|v| v.as_str()) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(text) = data.get("deltaContent").and_then(|v| v.as_str()) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn vscode_agent_mode_prefix(mode: Option<&str>) -> Option<&'static str> {
+    match mode {
+        Some("autopilot") => Some("/autopilot"),
+        Some("plan") => Some("/plan"),
+        _ => None,
+    }
+}
+
+fn extract_vscode_agent_user_text(event: &Value) -> Option<String> {
+    let data = event.get("data").unwrap_or(event);
+    let text = extract_vscode_agent_content_text(data)?;
+    let mode = data.get("agentMode").and_then(|v| v.as_str());
+    match vscode_agent_mode_prefix(mode) {
+        Some(prefix) if !text.starts_with(prefix) => Some(format!("{prefix} {text}")),
+        _ => Some(text),
+    }
+}
+
+fn extract_vscode_agent_event_timestamp(event: &Value) -> Option<String> {
+    event
+        .get("timestamp")
+        .or_else(|| event.get("data").and_then(|data| data.get("timestamp")))
+        .and_then(vscode_value_to_string)
+}
+
+fn extract_vscode_agent_event_model(event: &Value) -> Option<String> {
+    let data = event.get("data").unwrap_or(event);
+    data.get("model")
+        .or_else(|| data.get("modelId"))
+        .or_else(|| event.get("model"))
+        .and_then(vscode_value_to_string)
+}
+
+fn extract_vscode_agent_request_id(event: &Value) -> Option<String> {
+    event
+        .get("id")
+        .or_else(|| event.get("requestId"))
+        .or_else(|| event.get("data").and_then(|data| data.get("requestId")))
+        .and_then(vscode_value_to_string)
+}
+
+fn is_vscode_child_agent_event(event: &Value) -> bool {
+    event
+        .get("parentToolCallId")
+        .or_else(|| event.get("data").and_then(|data| data.get("parentToolCallId")))
+        .and_then(|value| value.as_str())
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn vscode_agent_assistant_content(event: &Value) -> Vec<Value> {
+    let data = event.get("data").unwrap_or(event);
+    if let Some(items) = data.get("content").and_then(|v| v.as_array()) {
+        return items
+            .iter()
+            .filter_map(|item| match item.get("type").and_then(|v| v.as_str()) {
+                Some("text") => item
+                    .get("text")
+                    .and_then(|text| text.as_str())
+                    .map(|text| serde_json::json!({ "type": "text", "text": text })),
+                Some("thinking") => item
+                    .get("thinking")
+                    .and_then(|text| text.as_str())
+                    .map(|text| serde_json::json!({ "type": "thinking", "thinking": text })),
+                Some("tool_use") => Some(item.clone()),
+                _ => None,
+            })
+            .collect();
+    }
+
+    extract_vscode_agent_content_text(data)
+        .map(|text| vec![serde_json::json!({ "type": "text", "text": text })])
+        .unwrap_or_default()
+}
+
+fn build_vscode_agent_event_timeline_events(events: &[Value]) -> Vec<TimelineEvent> {
+    struct PendingTurn {
+        line: usize,
+        timestamp: Option<String>,
+        request_id: Option<String>,
+        request_text: String,
+        request_raw: Value,
+        response_content: Vec<Value>,
+        response_model: Option<String>,
+        originals: Vec<Value>,
+    }
+
+    fn finalize_pending(pending: Option<PendingTurn>, output: &mut Vec<TimelineEvent>) {
+        let Some(pending) = pending else {
+            return;
+        };
+        let response_text = pending
+            .response_content
+            .iter()
+            .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary = [Some(pending.request_text.as_str()), Some(response_text.as_str())]
+            .into_iter()
+            .flatten()
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let request_raw = Some(pending.request_raw);
+        let response_raw = if pending.response_content.is_empty() {
+            None
+        } else {
+            Some(build_vscode_assistant_raw_with_model(
+                pending.response_content,
+                pending.response_model.as_deref(),
+                &Value::Array(pending.originals.clone()),
+            ))
+        };
+        output.push(TimelineEvent {
+            line: pending.line,
+            timestamp: pending.timestamp,
+            role: Some("assistant".to_string()),
+            event_type: Some("vscode_turn".to_string()),
+            subtype: Some("turn".to_string()),
+            uuid: None,
+            parent_uuid: None,
+            logical_parent_uuid: None,
+            session_id: None,
+            request_id: pending.request_id,
+            message_id: None,
+            tool_use_id: None,
+            parent_tool_use_id: None,
+            operation: None,
+            is_sidechain: None,
+            is_meta: None,
+            summary: truncate(&summary, 240),
+            raw: build_vscode_event_turn_raw(request_raw, response_raw, pending.originals),
+        });
+    }
+
+    let mut output = Vec::new();
+    let mut pending: Option<PendingTurn> = None;
+    let mut current_model: Option<String> = None;
+
+    for (index, event) in events.iter().enumerate() {
+        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match event_type {
+            "session.model_change" => {
+                current_model = extract_vscode_agent_event_model(event);
+            }
+            "user.message" => {
+                finalize_pending(pending.take(), &mut output);
+                let Some(request_text) = extract_vscode_agent_user_text(event) else {
+                    continue;
+                };
+                let request_model = current_model.as_deref();
+                pending = Some(PendingTurn {
+                    line: index + 1,
+                    timestamp: extract_vscode_agent_event_timestamp(event),
+                    request_id: extract_vscode_agent_request_id(event),
+                    request_raw: build_vscode_event_request_raw(&request_text, event, request_model),
+                    request_text,
+                    response_content: Vec::new(),
+                    response_model: current_model.clone(),
+                    originals: vec![event.clone()],
+                });
+            }
+            "assistant.message" | "assistant.message_delta" => {
+                if is_vscode_child_agent_event(event) {
+                    continue;
+                }
+                let content = vscode_agent_assistant_content(event);
+                if content.is_empty() {
+                    continue;
+                }
+                if let Some(turn) = pending.as_mut() {
+                    turn.response_content.extend(content);
+                    turn.originals.push(event.clone());
+                }
+            }
+            "assistant.usage" => {
+                if let Some(model) = extract_vscode_agent_event_model(event) {
+                    if let Some(turn) = pending.as_mut() {
+                        turn.response_model = Some(model.clone());
+                        turn.originals.push(event.clone());
+                    }
+                    current_model = Some(model);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    finalize_pending(pending, &mut output);
+    output
+}
+
+fn build_vscode_timeline_events(state: &Value) -> Vec<TimelineEvent> {
+    let mut events = Vec::new();
+    if let Some(agent_events) = state.get("events").and_then(|v| v.as_array()) {
+        return build_vscode_agent_event_timeline_events(agent_events);
+    }
+
+    let Some(requests) = state.get("requests").and_then(|v| v.as_array()) else {
+        return events;
+    };
+
+    for (index, request) in requests.iter().enumerate() {
+        let line = index + 1;
+        let timestamp = request.get("timestamp").and_then(vscode_value_to_string);
+        let request_id = request.get("requestId").and_then(vscode_value_to_string);
+        let response_model = extract_vscode_request_model(request);
+
+        let request_text = request
+            .get("message")
+            .and_then(extract_vscode_message_text);
+        let (response_text, response_content) = request
+            .get("response")
+            .map(extract_vscode_response_sections)
+            .unwrap_or_else(|| (None, Vec::new()));
+        if request_text.is_none() && response_content.is_empty() {
+            continue;
+        }
+        let summary = [request_text.as_deref(), response_text.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary = if summary.is_empty() {
+            "VS Code assistant sections".to_string()
+        } else {
+            summary
+        };
+
+        events.push(TimelineEvent {
+            line,
+            timestamp,
+            role: Some("assistant".to_string()),
+            event_type: Some("vscode_turn".to_string()),
+            subtype: Some("turn".to_string()),
+            uuid: None,
+            parent_uuid: None,
+            logical_parent_uuid: None,
+            session_id: None,
+            request_id,
+            message_id: None,
+            tool_use_id: None,
+            parent_tool_use_id: None,
+            operation: None,
+            is_sidechain: None,
+            is_meta: None,
+            summary: truncate(&summary, 240),
+            raw: build_vscode_turn_raw(
+                request_text.as_deref(),
+                response_content,
+                response_model.as_deref(),
+                request,
+            ),
+        });
+    }
+
+    events
+}
+
+fn read_vscode_copilot_session_timeline_from_path(
+    path: &Path,
+) -> Result<SessionTimelinePayload, String> {
+    let (state, errors) = if has_jsonl_extension(path) {
+        read_vscode_copilot_state_jsonl(path)?
+    } else {
+        read_vscode_copilot_state_json(path)?
+    };
+
+    let events = build_vscode_timeline_events(&state);
+    let start_time = events.first().and_then(|event| event.timestamp.clone());
+    let end_time = events.last().and_then(|event| event.timestamp.clone());
+
+    Ok(SessionTimelinePayload {
+        path: path.to_string_lossy().to_string(),
+        error_code: if errors.is_empty() {
+            None
+        } else {
+            Some(ERR_PARSE_PARTIAL.to_string())
+        },
+        errors,
+        events,
+        metadata: SessionMetadataAccumulator::default().build_metadata(start_time, end_time),
+    })
+}
+
+fn validate_vscode_copilot_session_file(target: &Path) -> Result<PathBuf, String> {
+    if !has_json_or_jsonl_extension(target) {
+        return Err(ERR_READ_FAILED.to_string());
+    }
+
+    let root = default_vscode_workspace_storage_path()?
+        .canonicalize()
+        .map_err(map_read_error)?;
+    let session_file = target.canonicalize().map_err(map_read_error)?;
+    if !session_file.starts_with(&root) {
+        return Err(ERR_READ_FAILED.to_string());
+    }
+    if !session_file.is_file() {
+        return Err(ERR_NOT_FOUND.to_string());
+    }
+    if session_file
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        != Some("chatSessions")
+    {
+        return Err(ERR_READ_FAILED.to_string());
+    }
+
+    Ok(session_file)
+}
+
+#[tauri::command]
+pub fn read_vscode_copilot_session_timeline(
+    session_path: String,
+) -> Result<SessionTimelinePayload, String> {
+    let target = Path::new(&session_path);
+    let session_file = validate_vscode_copilot_session_file(target)?;
+    read_vscode_copilot_session_timeline_from_path(&session_file)
 }
 
 fn default_codex_sessions_path() -> Result<PathBuf, String> {
@@ -1753,6 +2779,336 @@ mod tests {
     fn clear_project_cwd_cache() {
         let cache = PROJECT_CWD_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         cache.lock().expect("lock cache").clear();
+    }
+
+    #[test]
+    fn test_decode_vscode_workspace_folder_uri_windows_path() {
+        let decoded = decode_vscode_workspace_folder_uri("file:///d%3A/Hank/Dropbox/AI-Project/Unified-AI-Session-Explorer")
+            .expect("decode workspace URI");
+        assert_eq!(decoded, r"D:\Hank\Dropbox\AI-Project\Unified-AI-Session-Explorer");
+    }
+
+    #[test]
+    fn test_list_vscode_projects_from_workspace_storage() {
+        let root = unique_temp_dir("vscode-workspace-storage");
+        let workspace = root.join("812a28887692c48029817b9ae7c9cddf");
+        let chat = workspace.join("chatSessions");
+        fs::create_dir_all(&chat).expect("create chat sessions dir");
+        write_file(
+            &workspace.join("workspace.json"),
+            r#"{"folder":"file:///d%3A/Hank/Dropbox/AI-Project/Unified-AI-Session-Explorer"}"#,
+        );
+        write_file(
+            &chat.join("session-one.json"),
+            r#"{"version":3,"sessionId":"session-one","creationDate":1710000000000,"requests":[]}"#,
+        );
+
+        let projects = list_vscode_copilot_projects_from_root(&root).expect("list vscode projects");
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].source, "vscode");
+        assert_eq!(projects[0].name, "Unified-AI-Session-Explorer");
+        assert_eq!(
+            projects[0].cwd_path.as_deref(),
+            Some(r"D:\Hank\Dropbox\AI-Project\Unified-AI-Session-Explorer")
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn test_list_vscode_project_entries_from_root() {
+        let root = unique_temp_dir("vscode-project-entries");
+        let workspace = root.join("812a28887692c48029817b9ae7c9cddf");
+        let chat = workspace.join("chatSessions");
+        fs::create_dir_all(&chat).expect("create chat sessions dir");
+        write_file(
+            &workspace.join("workspace.json"),
+            r#"{"folder":"file:///d%3A/project/demo"}"#,
+        );
+        write_file(&chat.join("empty.json"), r#"{"version":3,"requests":[]}"#);
+        write_file(
+            &chat.join("visible.json"),
+            r#"{"requests":[{"message":{"text":"hello"},"response":[{"value":"hi"}]}]}"#,
+        );
+
+        let entries = list_vscode_copilot_project_entries_from_root(r"D:\project\demo", &root)
+            .expect("list vscode project entries");
+        let labels: Vec<&str> = entries.iter().map(|entry| entry.label.as_str()).collect();
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries.iter().all(|entry| entry.entry_type == "session"));
+        assert!(entries.iter().all(|entry| entry.source == "vscode"));
+        assert!(labels.contains(&"visible.json"));
+        assert!(!labels.contains(&"empty.json"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn test_read_vscode_json_session_timeline() {
+        let root = unique_temp_dir("vscode-json-timeline");
+        let session = root.join("session.json");
+        write_file(
+            &session,
+            r#"{"requests":[{"requestId":"req-1","timestamp":1710000000000,"modelId":"copilot/claude-sonnet-4.6","result":{"metadata":{"resolvedModel":"claude-sonnet-4-6"}},"message":{"text":"Hello Copilot"},"response":[{"value":"Hello from VS Code"}]}]}"#,
+        );
+
+        let payload = read_vscode_copilot_session_timeline_from_path(&session)
+            .expect("read vscode timeline");
+
+        assert_eq!(payload.events.len(), 1);
+        assert_eq!(payload.events[0].role.as_deref(), Some("assistant"));
+        assert_eq!(payload.events[0].event_type.as_deref(), Some("vscode_turn"));
+        assert_eq!(payload.events[0].subtype.as_deref(), Some("turn"));
+        assert_eq!(payload.events[0].summary, "Hello Copilot\nHello from VS Code");
+        assert_eq!(
+            payload.events[0]
+                .raw
+                .get("vscodeTurn")
+                .and_then(|turn| turn.get("request"))
+                .and_then(|request| request.get("message"))
+                .and_then(|message| message.get("content"))
+                .and_then(|content| content.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("text"))
+                .and_then(|text| text.as_str()),
+            Some("Hello Copilot")
+        );
+        assert_eq!(
+            payload.events[0]
+                .raw
+                .get("vscodeTurn")
+                .and_then(|turn| turn.get("response"))
+                .and_then(|response| response.get("message"))
+                .and_then(|message| message.get("content"))
+                .and_then(|content| content.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("text"))
+                .and_then(|text| text.as_str()),
+            Some("Hello from VS Code")
+        );
+        assert_eq!(
+            payload.events[0]
+                .raw
+                .get("vscodeTurn")
+                .and_then(|turn| turn.get("response"))
+                .and_then(|response| response.get("message"))
+                .and_then(|message| message.get("model"))
+                .and_then(|model| model.as_str()),
+            Some("claude-sonnet-4-6")
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn test_read_vscode_jsonl_session_replays_state() {
+        let root = unique_temp_dir("vscode-jsonl-timeline");
+        let session = root.join("session.jsonl");
+        write_file(
+            &session,
+            "{\"kind\":0,\"v\":{\"requests\":[]}}\n{\"kind\":2,\"k\":[\"requests\"],\"v\":[{\"message\":{\"text\":\"Question\"},\"response\":[{\"value\":\"Answer\"}]}]}\n",
+        );
+
+        let payload = read_vscode_copilot_session_timeline_from_path(&session)
+            .expect("read vscode timeline");
+
+        assert_eq!(payload.events.len(), 1);
+        assert_eq!(payload.events[0].summary, "Question\nAnswer");
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn test_read_vscode_jsonl_session_splices_requests() {
+        let root = unique_temp_dir("vscode-jsonl-request-splice");
+        let session = root.join("session.jsonl");
+        write_file(
+            &session,
+            "{\"kind\":0,\"v\":{\"requests\":[]}}\n{\"kind\":2,\"k\":[\"requests\"],\"v\":[{\"message\":{\"text\":\"First question\"},\"response\":[{\"value\":\"First answer\"}]}]}\n{\"kind\":2,\"k\":[\"requests\"],\"v\":[{\"message\":{\"text\":\"Second question\"},\"response\":[{\"value\":\"Second answer\"}]}]}\n",
+        );
+
+        let payload = read_vscode_copilot_session_timeline_from_path(&session)
+            .expect("read vscode timeline");
+        let summaries: Vec<&str> = payload
+            .events
+            .iter()
+            .map(|event| event.summary.as_str())
+            .collect();
+
+        assert_eq!(summaries, vec!["First question\nFirst answer", "Second question\nSecond answer"]);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn test_read_vscode_jsonl_session_splices_response_chunks_at_index() {
+        let root = unique_temp_dir("vscode-jsonl-response-splice");
+        let session = root.join("session.jsonl");
+        write_file(
+            &session,
+            "{\"kind\":0,\"v\":{\"requests\":[]}}\n{\"kind\":2,\"k\":[\"requests\"],\"v\":[{\"message\":{\"text\":\"Question\"},\"response\":[{\"value\":\"A\"},{\"value\":\"D\"}]}]}\n{\"kind\":2,\"k\":[\"requests\",0,\"response\"],\"i\":1,\"v\":[{\"value\":\"B\"},{\"value\":\"C\"}]}\n",
+        );
+
+        let payload = read_vscode_copilot_session_timeline_from_path(&session)
+            .expect("read vscode timeline");
+
+        assert_eq!(payload.events.len(), 1);
+        assert_eq!(payload.events[0].summary, "Question\nA\nB\nC\nD");
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn test_read_vscode_session_splits_assistant_sections() {
+        let root = unique_temp_dir("vscode-section-split");
+        let session = root.join("session.json");
+        write_file(
+            &session,
+            r#"{"requests":[{"requestId":"req-1","timestamp":1710000000000,"message":{"text":"Explain"},"response":[{"value":"Visible answer"},{"kind":"thinking","value":"Hidden reasoning"},{"kind":"toolInvocationSerialized","toolCallId":"tool-1","toolId":"copilot_readFile","invocationMessage":"Reading file","pastTenseMessage":"Read file","isComplete":true},{"kind":"textEditGroup","uri":{"path":"/tmp/app.js"},"edits":[{"newText":"console.log(1);"}],"done":true}]}]}"#,
+        );
+
+        let payload = read_vscode_copilot_session_timeline_from_path(&session)
+            .expect("read vscode timeline");
+        let assistant = payload.events.first().expect("assistant turn");
+        let content = assistant
+            .raw
+            .get("vscodeTurn")
+            .and_then(|turn| turn.get("response"))
+            .and_then(|response| response.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.as_array())
+            .expect("normalized content");
+
+        assert_eq!(assistant.summary, "Explain\nVisible answer");
+        assert_eq!(content[0].get("type").and_then(|v| v.as_str()), Some("text"));
+        assert_eq!(content[0].get("text").and_then(|v| v.as_str()), Some("Visible answer"));
+        assert_eq!(content[1].get("type").and_then(|v| v.as_str()), Some("thinking"));
+        assert_eq!(
+            content[1].get("thinking").and_then(|v| v.as_str()),
+            Some("Hidden reasoning")
+        );
+        assert_eq!(content[2].get("type").and_then(|v| v.as_str()), Some("tool_use"));
+        assert_eq!(content[2].get("id").and_then(|v| v.as_str()), Some("tool-1"));
+        assert_eq!(content[2].get("name").and_then(|v| v.as_str()), Some("copilot_readFile"));
+        assert_eq!(content[3].get("type").and_then(|v| v.as_str()), Some("tool_use"));
+        assert_eq!(content[3].get("name").and_then(|v| v.as_str()), Some("VSCodeFileChange"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn test_read_vscode_session_preserves_request_order_over_timestamps() {
+        let root = unique_temp_dir("vscode-request-order");
+        let session = root.join("session.json");
+        write_file(
+            &session,
+            r#"{"requests":[{"requestId":"req-1","timestamp":2000,"message":{"text":"Q1"},"response":[{"value":"A1"}]},{"requestId":"req-2","timestamp":1000,"message":{"text":"Q2"},"response":[{"value":"A2"}]}]}"#,
+        );
+
+        let payload = read_vscode_copilot_session_timeline_from_path(&session)
+            .expect("read vscode timeline");
+        let summaries: Vec<&str> = payload
+            .events
+            .iter()
+            .map(|event| event.summary.as_str())
+            .collect();
+
+        assert_eq!(summaries, vec!["Q1\nA1", "Q2\nA2"]);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn test_read_vscode_jsonl_session_appends_array_index_patch() {
+        let root = unique_temp_dir("vscode-jsonl-append-patch");
+        let session = root.join("session.jsonl");
+        write_file(
+            &session,
+            "{\"kind\":0,\"v\":{\"requests\":[]}}\n{\"kind\":2,\"k\":[\"requests\",0],\"v\":{\"message\":{\"text\":\"Append question\"},\"response\":[{\"value\":\"Append answer\"}]}}\n",
+        );
+
+        let payload = read_vscode_copilot_session_timeline_from_path(&session)
+            .expect("read vscode timeline");
+
+        assert_eq!(payload.events.len(), 1);
+        assert_eq!(payload.events[0].summary, "Append question\nAppend answer");
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn test_read_vscode_jsonl_agent_events_builds_turns() {
+        let root = unique_temp_dir("vscode-jsonl-agent-events");
+        let session = root.join("session.jsonl");
+        write_file(
+            &session,
+            concat!(
+                "{\"type\":\"session.model_change\",\"data\":{\"model\":\"gpt-5.4\"}}\n",
+                "{\"type\":\"user.message\",\"id\":\"sdk-req-1\",\"timestamp\":1779194731541,\"data\":{\"content\":\"Fix the bug\",\"agentMode\":\"plan\"}}\n",
+                "{\"type\":\"assistant.message\",\"id\":\"a1\",\"data\":{\"messageId\":\"msg-1\",\"content\":\"Top-level reply\"}}\n",
+                "{\"type\":\"assistant.message_delta\",\"id\":\"a2\",\"data\":{\"messageId\":\"msg-2\",\"deltaContent\":\"sub-agent thinking\",\"parentToolCallId\":\"task-1\"}}\n",
+                "{\"type\":\"assistant.message\",\"id\":\"a3\",\"data\":{\"messageId\":\"msg-3\",\"content\":\"sub-agent result\",\"parentToolCallId\":\"task-1\"}}\n",
+                "{\"type\":\"assistant.message\",\"id\":\"a4\",\"data\":{\"messageId\":\"msg-4\",\"content\":\"Final answer\"}}\n",
+                "{\"type\":\"assistant.usage\",\"data\":{\"model\":\"gpt-5.4\",\"inputTokens\":10,\"outputTokens\":5}}\n",
+                "{\"type\":\"user.message\",\"id\":\"sdk-req-2\",\"data\":{\"content\":\"Next question\",\"agentMode\":\"autopilot\"}}\n",
+                "{\"type\":\"assistant.message\",\"data\":{\"content\":\"Next answer\"}}\n",
+            ),
+        );
+
+        let payload = read_vscode_copilot_session_timeline_from_path(&session)
+            .expect("read vscode agent event timeline");
+        let summaries: Vec<&str> = payload
+            .events
+            .iter()
+            .map(|event| event.summary.as_str())
+            .collect();
+
+        assert_eq!(
+            summaries,
+            vec![
+                "/plan Fix the bug\nTop-level reply\nFinal answer",
+                "/autopilot Next question\nNext answer",
+            ]
+        );
+        assert_eq!(payload.events[0].timestamp.as_deref(), Some("1779194731541"));
+        assert_eq!(payload.events[0].request_id.as_deref(), Some("sdk-req-1"));
+
+        let first_turn = payload.events[0].raw.get("vscodeTurn").expect("first turn");
+        assert_eq!(
+            first_turn
+                .get("request")
+                .and_then(|request| request.get("message"))
+                .and_then(|message| message.get("content"))
+                .and_then(|content| content.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("text"))
+                .and_then(|text| text.as_str()),
+            Some("/plan Fix the bug")
+        );
+        assert_eq!(
+            first_turn
+                .get("response")
+                .and_then(|response| response.get("message"))
+                .and_then(|message| message.get("model"))
+                .and_then(|model| model.as_str()),
+            Some("gpt-5.4")
+        );
+        let response_text = first_turn
+            .get("response")
+            .and_then(|response| response.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.as_array())
+            .expect("response content")
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|text| text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(response_text, "Top-level reply\nFinal answer");
+        assert!(!response_text.contains("sub-agent"));
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

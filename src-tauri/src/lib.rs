@@ -17,7 +17,10 @@ pub fn run() {
             project_browser::list_codex_projects,
             project_browser::list_codex_project_entries,
             project_browser::read_codex_session_timeline,
-            project_browser::delete_codex_session
+            project_browser::delete_codex_session,
+            project_browser::list_vscode_copilot_projects,
+            project_browser::list_vscode_copilot_project_entries,
+            project_browser::read_vscode_copilot_session_timeline
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -43,9 +43,10 @@ const state = {
   themeMode: "auto",
   resolvedTheme: "dark",
   locale: "en-US",
-  sourceToggles: { claude: true, codex: true },
+  sourceToggles: { claude: true, codex: true, vscode: true },
   allClaudeProjects: [],
   allCodexProjects: [],
+  allVscodeProjects: [],
   entrySearchQuery: "",
   entrySearchResults: null,
   isSearchingEntries: false,
@@ -69,6 +70,7 @@ const refs = {
   sourceToggleWrap: null,
   sourceToggleClaude: null,
   sourceToggleCodex: null,
+  sourceToggleVscode: null,
   entriesList: null,
   entriesSearchInput: null,
   entryDateFilterWrap: null,
@@ -258,6 +260,17 @@ function getProjectDisplayName(project) {
   const decodedParts = normalizeDisplayPath(decoded).split(/[\\/]/).filter(Boolean);
   if (decodedParts.length > 0) return decodedParts[decodedParts.length - 1];
   return decoded || tt("panel.projects");
+}
+
+function normalizeProjectKey(path) {
+  return String(path || "").replace(/\\/g, "/").toLowerCase().replace(/\/$/, "");
+}
+
+function getSourceLabel(source) {
+  if (source === "claude") return tt("source.claude");
+  if (source === "codex") return tt("source.codex");
+  if (source === "vscode") return tt("source.vscode");
+  return source;
 }
 
 function doesProjectMatchSearch(project, query) {
@@ -525,27 +538,48 @@ function showContextMenu(x, y, items) {
 function openProjectContextMenu(event, project) {
   event.preventDefault();
   state.ctxMenuTarget = event.currentTarget;
-  showContextMenu(event.clientX, event.clientY, [
+  const items = [
     {
       label: tt("action.openFolder"),
       onClick: () => {
         void window.__TAURI__.opener.openPath(project.cwdPath || project.path);
       },
     },
-    {
+  ];
+  if (project.claudePath || project.codexCwd) {
+    items.push({
       label: tt("action.deleteProject"),
       kind: "danger",
       onClick: () => {
         void openProjectDeleteDialog(project);
       },
-    },
-  ]);
+    });
+  }
+  showContextMenu(event.clientX, event.clientY, items);
+}
+
+function getParentPath(filePath) {
+  const path = String(filePath || "").trim();
+  const index = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return index > 0 ? path.slice(0, index) : path;
+}
+
+async function revealFileInFolder(filePath) {
+  const path = String(filePath || "").trim();
+  if (!path) return;
+
+  const opener = window.__TAURI__?.opener;
+  if (typeof opener?.revealItemInDir === "function") {
+    await opener.revealItemInDir(path);
+    return;
+  }
+  await opener?.openPath?.(getParentPath(path));
 }
 
 function openEntryContextMenu(event, entry) {
   event.preventDefault();
   state.ctxMenuTarget = event.currentTarget;
-  showContextMenu(event.clientX, event.clientY, [
+  const items = [
     {
       label: tt("action.copySessionId"),
       onClick: async () => {
@@ -558,13 +592,20 @@ function openEntryContextMenu(event, entry) {
       },
     },
     {
+      label: tt("action.openFileLocation"),
+      onClick: () => revealFileInFolder(entry.path),
+    },
+  ];
+  if (entry.source !== "vscode") {
+    items.push({
       label: tt("action.deleteConversation"),
       kind: "danger",
       onClick: () => {
         openSessionDeleteDialog(entry);
       },
-    },
-  ]);
+    });
+  }
+  showContextMenu(event.clientX, event.clientY, items);
 }
 
 function createActionWrap(...buttons) {
@@ -970,6 +1011,7 @@ function recomputeVisibleProjects() {
   state.projects = mergeProjects(
     state.sourceToggles.claude ? state.allClaudeProjects : [],
     state.sourceToggles.codex ? state.allCodexProjects : [],
+    state.sourceToggles.vscode ? state.allVscodeProjects : [],
   );
 }
 
@@ -1087,7 +1129,7 @@ async function executeProjectDelete(pending) {
 }
 
 function updateSourceToggleUI() {
-  const { claude, codex } = state.sourceToggles;
+  const { claude, codex, vscode } = state.sourceToggles;
   if (refs.sourceToggleClaude) {
     refs.sourceToggleClaude.dataset.active = claude ? "true" : "false";
     refs.sourceToggleClaude.setAttribute("aria-pressed", claude ? "true" : "false");
@@ -1095,6 +1137,10 @@ function updateSourceToggleUI() {
   if (refs.sourceToggleCodex) {
     refs.sourceToggleCodex.dataset.active = codex ? "true" : "false";
     refs.sourceToggleCodex.setAttribute("aria-pressed", codex ? "true" : "false");
+  }
+  if (refs.sourceToggleVscode) {
+    refs.sourceToggleVscode.dataset.active = vscode ? "true" : "false";
+    refs.sourceToggleVscode.setAttribute("aria-pressed", vscode ? "true" : "false");
   }
 }
 
@@ -1119,7 +1165,7 @@ function renderProjects() {
     if (Array.isArray(project.sources) && project.sources.length > 0) {
       const sourceRow = createElement("div", "project-sources");
       for (const src of project.sources) {
-        const badge = createElement("span", `source-badge source-badge--${src}`, src === "claude" ? "Claude" : "Codex");
+        const badge = createElement("span", `source-badge source-badge--${src}`, getSourceLabel(src));
         sourceRow.appendChild(badge);
       }
       button.append(sourceRow);
@@ -1212,6 +1258,17 @@ function extractHeaderModelLabel(raw) {
   const modelCandidate = message?.model ?? raw?.model ?? message?.model_name ?? raw?.model_name;
   const model = String(modelCandidate || "").trim();
   return model ? `model:${model}` : "";
+}
+
+function extractModelName(raw) {
+  const message = raw?.message && typeof raw.message === "object" ? raw.message : null;
+  const modelCandidate = message?.model ?? raw?.model ?? message?.model_name ?? raw?.model_name;
+  return String(modelCandidate || "").trim();
+}
+
+function formatVscodeChatTitle(raw) {
+  const model = extractModelName(raw);
+  return model ? `${tt("chat.vscode")} (${model})` : tt("chat.vscode");
 }
 
 function renderViewerMeta(pathText, rightText = "") {
@@ -1508,8 +1565,8 @@ function createEntryButton(
   const secondary = createElement("div", "entry-secondary", secondaryParts.join(" · "));
   button.append(primary, secondary);
 
-  if (entry.source === "claude" || entry.source === "codex") {
-    const srcLabel = entry.source === "claude" ? tt("source.claude") : tt("source.codex");
+  if (entry.source === "claude" || entry.source === "codex" || entry.source === "vscode") {
+    const srcLabel = getSourceLabel(entry.source);
     const badge = createElement("span", `source-badge source-badge--${entry.source}`, srcLabel);
     primary.appendChild(badge);
   }
@@ -1534,7 +1591,17 @@ function renderMemory(payload) {
 
 function formatTimestamp(timestamp) {
   if (!timestamp) return "-";
-  const value = new Date(timestamp);
+  const raw = typeof timestamp === "string" ? timestamp.trim() : timestamp;
+  const numeric =
+    typeof raw === "number"
+      ? raw
+      : typeof raw === "string" && /^[0-9]+(?:\.[0-9]+)?$/.test(raw)
+        ? Number(raw)
+        : null;
+  const value =
+    numeric !== null && Number.isFinite(numeric)
+      ? new Date(numeric < 10_000_000_000 ? numeric * 1000 : numeric)
+      : new Date(raw);
   if (Number.isNaN(value.getTime())) return String(timestamp);
   return value.toLocaleString("zh-TW", { hour12: false });
 }
@@ -1920,6 +1987,58 @@ function buildToolUseDetail(item) {
     return {
       toolName,
       title: tt("tool.lsp.title"),
+      lines: lines.length > 0 ? lines : fallbackInput,
+    };
+  }
+
+  if (toolName === "VSCodeFileChange") {
+    const filePath =
+      typeof input.file_path === "string"
+        ? input.file_path.trim()
+        : typeof input.uri === "string"
+          ? input.uri.trim()
+          : "";
+    const editCount = Number.isFinite(input.edit_count) ? input.edit_count : null;
+    const done = typeof input.done === "boolean" ? input.done : null;
+    const lines = [];
+    if (filePath) lines.push(tt("tool.label.file", { text: filePath }));
+    if (editCount !== null) lines.push(tt("tool.label.editCount", { count: editCount }));
+    if (done !== null) lines.push(tt("tool.label.status", { text: done ? "done" : "pending" }));
+    return {
+      toolName,
+      title: tt("tool.vscode.fileChange.title"),
+      lines: lines.length > 0 ? lines : fallbackInput,
+    };
+  }
+
+  if (toolName === "VSCodeSystem") {
+    const kind = typeof input.kind === "string" ? input.kind.trim() : "";
+    const title = typeof input.title === "string" ? input.title.trim() : "";
+    const message = typeof input.message === "string" ? input.message.trim() : "";
+    const questionCount = Array.isArray(input.questions) ? input.questions.length : null;
+    const lines = [];
+    if (kind) lines.push(tt("tool.label.kind", { text: kind }));
+    if (title) lines.push(tt("tool.label.title", { text: title }));
+    if (message) lines.push(tt("tool.label.message", { text: message }));
+    if (questionCount !== null) lines.push(tt("tool.label.questionCount", { count: questionCount }));
+    return {
+      toolName,
+      title: tt("tool.vscode.system.title"),
+      lines: lines.length > 0 ? lines : fallbackInput,
+    };
+  }
+
+  if (/^copilot_/i.test(toolName)) {
+    const lines = [];
+    for (const key of ["invocationMessage", "pastTenseMessage", "generatedTitle", "source"]) {
+      const value = stringifyCompact(input[key]);
+      if (value) lines.push(`${key}: ${truncateText(value, 180)}`);
+    }
+    const resultDetails = stringifyCompact(input.resultDetails);
+    if (resultDetails) lines.push(`resultDetails: ${truncateText(resultDetails, 220)}`);
+    return {
+      toolName,
+      title: tt("tool.vscode.copilot.title", { name: toolName }),
       lines: lines.length > 0 ? lines : fallbackInput,
     };
   }
@@ -2605,6 +2724,59 @@ function normalizeEvents(events) {
   for (const event of events) {
     const raw = event.raw || {};
     const rawType = raw.type || event.eventType || "unknown";
+    const isVscodeEvent = String(event.eventType || "").startsWith("vscode_");
+    if (rawType === "vscode_turn" && raw.vscodeTurn && typeof raw.vscodeTurn === "object") {
+      const requestRaw = raw.vscodeTurn.request || null;
+      const responseRaw = raw.vscodeTurn.response || null;
+      const requestId = event.requestId || raw.requestId || "";
+
+      if (requestRaw) {
+        const text = extractTextSummary(requestRaw, toolResultsMap);
+        normalized.push({
+          kind: "chat_user",
+          source: "vscode",
+          requestId,
+          line: event.line,
+          timestamp: event.timestamp,
+          title: tt("chat.user"),
+          headerModel: "",
+          summary: text.summary,
+          conversationSummary: extractChatOnlySummary(requestRaw),
+          conversationToolSummary: "",
+          tags: text.tags,
+          thinkingDetails: text.thinkingDetails,
+          toolUseDetails: text.toolUseDetails,
+          toolResultDetails: text.toolResultDetails,
+          raw: requestRaw,
+        });
+      }
+
+      if (responseRaw) {
+        const text = extractTextSummary(responseRaw, toolResultsMap);
+        normalized.push({
+          kind: "chat_assistant",
+          source: "vscode",
+          requestId,
+          line: event.line,
+          timestamp: event.timestamp,
+          title: formatVscodeChatTitle(responseRaw),
+          headerModel: "",
+          summary: text.summary,
+          conversationSummary: extractChatOnlySummary(responseRaw),
+          conversationToolSummary: (() => {
+            const names = extractToolTagNames(text.tags);
+            if (names.length === 0) return "";
+            return tt("summary.toolTags", { names: names.join(", ") });
+          })(),
+          tags: text.tags,
+          thinkingDetails: text.thinkingDetails,
+          toolUseDetails: text.toolUseDetails,
+          toolResultDetails: text.toolResultDetails,
+          raw: responseRaw,
+        });
+      }
+      continue;
+    }
     const role = raw.message?.role;
     const codexRole = getCodexChatRole(raw);
     const contentItems = normalizeContentItems(raw.message?.content || raw.content);
@@ -2646,6 +2818,7 @@ function normalizeEvents(events) {
         normalized.push({
           kind: roleType === "user" ? "chat_user" : "chat_assistant",
           source: "codex",
+          requestId: event.requestId || raw.requestId || "",
           line: event.line,
           timestamp: event.timestamp,
           title: roleType === "user" ? tt("chat.user") : tt("chat.codex"),
@@ -2677,11 +2850,12 @@ function normalizeEvents(events) {
       }
       normalized.push({
         kind: roleType === "user" ? "chat_user" : "chat_assistant",
-        source: "claude",
+        source: isVscodeEvent ? "vscode" : "claude",
+        requestId: event.requestId || raw.requestId || "",
         line: event.line,
         timestamp: event.timestamp,
-        title: roleType === "user" ? tt("chat.user") : tt("chat.assistant"),
-        headerModel: extractHeaderModelLabel(raw),
+        title: roleType === "user" ? tt("chat.user") : isVscodeEvent ? formatVscodeChatTitle(raw) : tt("chat.assistant"),
+        headerModel: isVscodeEvent ? "" : extractHeaderModelLabel(raw),
         summary: text.summary,
         conversationSummary: extractChatOnlySummary(raw),
         conversationToolSummary: (() => {
@@ -2706,6 +2880,7 @@ function normalizeEvents(events) {
       normalized.push({
         kind: "chat_assistant",
         source: "codex",
+        requestId: event.requestId || raw.requestId || "",
         line: event.line,
         timestamp: event.timestamp,
         title: tt("chat.codex"),
@@ -2743,6 +2918,7 @@ function normalizeEvents(events) {
         normalized.push({
           kind: "chat_assistant",
           source: "codex",
+          requestId: event.requestId || raw.requestId || "",
           line: event.line,
           timestamp: event.timestamp,
           title: tt("chat.codex"),
@@ -2780,8 +2956,51 @@ function normalizeEvents(events) {
   return normalized;
 }
 
+function orderVscodeRequestPairs(items) {
+  const groups = new Map();
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    const requestId = String(item?.requestId || "").trim();
+    if (!requestId || item?.source !== "vscode" || !String(item?.kind || "").startsWith("chat")) {
+      continue;
+    }
+    if (!groups.has(requestId)) {
+      groups.set(requestId, { firstIndex: index, items: [] });
+    }
+    groups.get(requestId).items.push({ item, index });
+  }
+
+  const groupedIndexes = new Set();
+  for (const group of groups.values()) {
+    if (group.items.length < 2) continue;
+    for (const entry of group.items) groupedIndexes.add(entry.index);
+    group.items.sort((a, b) => {
+      const rank = (value) => value.item.kind === "chat_user" ? 0 : value.item.kind === "chat_assistant" ? 1 : 2;
+      return rank(a) - rank(b) || a.index - b.index;
+    });
+  }
+
+  if (groupedIndexes.size === 0) return items;
+
+  const emitted = new Set();
+  const ordered = [];
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    const requestId = String(item?.requestId || "").trim();
+    const group = requestId ? groups.get(requestId) : null;
+    if (!group || !groupedIndexes.has(index)) {
+      ordered.push(item);
+      continue;
+    }
+    if (emitted.has(requestId)) continue;
+    for (const entry of group.items) ordered.push(entry.item);
+    emitted.add(requestId);
+  }
+  return ordered;
+}
+
 function buildTimelineItems(events) {
-  const normalized = normalizeEvents(events);
+  const normalized = orderVscodeRequestPairs(normalizeEvents(events));
   const items = [];
   let currentTechGroup = null;
   let nextGroupId = 1;
@@ -3372,6 +3591,7 @@ function initDomRefs() {
     sourceToggleWrap: "#source-toggle-wrap",
     sourceToggleClaude: "#source-toggle-claude",
     sourceToggleCodex: "#source-toggle-codex",
+    sourceToggleVscode: "#source-toggle-vscode",
     entriesList: "#entries-list",
     entriesSearchInput: "#entries-search-input",
     entryDateFilterWrap: "#entry-date-filter",
@@ -3414,24 +3634,25 @@ function initDomRefs() {
   refs.themeButtons = Array.from(document.querySelectorAll(".theme-btn"));
 }
 
-function mergeProjects(claudeProjects, codexProjects) {
+function mergeProjects(claudeProjects, codexProjects, vscodeProjects) {
   const merged = new Map(); // normalized cwd → merged project object
 
   for (const p of claudeProjects) {
-    const key = (p.cwdPath || p.path).replace(/\\/g, "/").toLowerCase().replace(/\/$/, "");
+    const key = normalizeProjectKey(p.cwdPath || p.path);
     merged.set(key, {
       name: p.name,
       path: p.path,
       cwdPath: p.cwdPath,
       claudePath: p.path,
       codexCwd: null,
+      vscodeCwd: null,
       modifiedMs: p.modifiedMs,
       sources: ["claude"],
     });
   }
 
   for (const p of codexProjects) {
-    const key = (p.cwdPath || p.path).replace(/\\/g, "/").toLowerCase().replace(/\/$/, "");
+    const key = normalizeProjectKey(p.cwdPath || p.path);
     if (merged.has(key)) {
       const existing = merged.get(key);
       existing.codexCwd = p.cwdPath || p.path;
@@ -3446,8 +3667,33 @@ function mergeProjects(claudeProjects, codexProjects) {
         cwdPath: p.cwdPath,
         claudePath: null,
         codexCwd: p.cwdPath || p.path,
+        vscodeCwd: null,
         modifiedMs: p.modifiedMs,
         sources: ["codex"],
+      });
+    }
+  }
+
+  for (const p of vscodeProjects) {
+    const cwd = p.cwdPath || p.path;
+    const key = normalizeProjectKey(cwd);
+    if (merged.has(key)) {
+      const existing = merged.get(key);
+      existing.vscodeCwd = cwd;
+      existing.sources.push("vscode");
+      if ((p.modifiedMs || 0) > (existing.modifiedMs || 0)) {
+        existing.modifiedMs = p.modifiedMs;
+      }
+    } else {
+      merged.set(key, {
+        name: getProjectDisplayName(p),
+        path: cwd,
+        cwdPath: cwd,
+        claudePath: null,
+        codexCwd: null,
+        vscodeCwd: cwd,
+        modifiedMs: p.modifiedMs,
+        sources: ["vscode"],
       });
     }
   }
@@ -3458,12 +3704,14 @@ function mergeProjects(claudeProjects, codexProjects) {
 async function loadProjects() {
   setInfoStatus("status.loadingProjects");
   try {
-    const [claudeProjects, codexProjects] = await Promise.all([
+    const [claudeProjects, codexProjects, vscodeProjects] = await Promise.all([
       invoke("list_projects").catch(() => []),
       invoke("list_codex_projects").catch(() => []),
+      invoke("list_vscode_copilot_projects").catch(() => []),
     ]);
     state.allClaudeProjects = claudeProjects;
     state.allCodexProjects = codexProjects;
+    state.allVscodeProjects = vscodeProjects;
     recomputeVisibleProjects();
     renderProjects();
     setInfoStatus("status.projectsLoaded", { count: state.projects.length });
@@ -3498,9 +3746,14 @@ async function selectProject(projectPath) {
     } else {
       fetches.push(Promise.resolve([]));
     }
+    if (project?.vscodeCwd && state.sourceToggles.vscode) {
+      fetches.push(invoke("list_vscode_copilot_project_entries", { cwd: project.vscodeCwd }));
+    } else {
+      fetches.push(Promise.resolve([]));
+    }
 
-    const [claudeEntries, codexEntries] = await Promise.all(fetches);
-    const all = [...claudeEntries, ...codexEntries];
+    const [claudeEntries, codexEntries, vscodeEntries] = await Promise.all(fetches);
+    const all = [...claudeEntries, ...codexEntries, ...vscodeEntries];
     all.sort((a, b) => (b.modifiedMs || 0) - (a.modifiedMs || 0));
 
     state.entries = all;
@@ -3544,9 +3797,14 @@ async function selectEntry(entry) {
       return;
     }
 
-    const payload = entry.source === "codex"
-      ? await invoke("read_codex_session_timeline", { sessionPath: entry.path })
-      : await invoke("read_session_timeline", { sessionPath: entry.path, strictMode: true });
+    let payload;
+    if (entry.source === "codex") {
+      payload = await invoke("read_codex_session_timeline", { sessionPath: entry.path });
+    } else if (entry.source === "vscode") {
+      payload = await invoke("read_vscode_copilot_session_timeline", { sessionPath: entry.path });
+    } else {
+      payload = await invoke("read_session_timeline", { sessionPath: entry.path, strictMode: true });
+    }
     setHideSystemEventsVisible(true);
     renderTimeline(payload);
     if (payload.errorCode) {
@@ -3579,6 +3837,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   bindClick(refs.sourceToggleCodex, () => {
     state.sourceToggles.codex = !state.sourceToggles.codex;
+    updateSourceToggleUI();
+    recomputeVisibleProjects();
+    renderProjects();
+  });
+  bindClick(refs.sourceToggleVscode, () => {
+    state.sourceToggles.vscode = !state.sourceToggles.vscode;
     updateSourceToggleUI();
     recomputeVisibleProjects();
     renderProjects();

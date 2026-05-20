@@ -7,24 +7,29 @@ import { JSDOM } from "jsdom";
 const ROOT = process.cwd();
 const INDEX_HTML = path.join(ROOT, "src", "index.html");
 
-function createMockInvoke() {
+function createMockInvoke(options = {}) {
   const calls = [];
-  const claudeProjects = [
-    {
-      name: "demo-project",
-      path: "D:/mock/demo-project",
-      cwdPath: "D:/mock/demo-project",
-      modifiedMs: Date.now(),
-    },
-  ];
-  const codexProjects = [
-    {
-      name: "demo-project",
-      path: "D:/mock/demo-project",
-      cwdPath: "D:/mock/demo-project",
-      modifiedMs: Date.now() - 500,
-    },
-  ];
+  const includeVscode = options.includeVscode === true;
+  const claudeProjects = options.vscodeOnly
+    ? []
+    : [
+        {
+          name: "demo-project",
+          path: "D:/mock/demo-project",
+          cwdPath: "D:/mock/demo-project",
+          modifiedMs: Date.now(),
+        },
+      ];
+  const codexProjects = options.vscodeOnly
+    ? []
+    : [
+        {
+          name: "demo-project",
+          path: "D:/mock/demo-project",
+          cwdPath: "D:/mock/demo-project",
+          modifiedMs: Date.now() - 500,
+        },
+      ];
   const claudeEntries = [
     {
       entryType: "session",
@@ -70,13 +75,39 @@ function createMockInvoke() {
       source: "codex",
     },
   ];
+  const vscodeProjects = includeVscode
+    ? [
+        {
+          name: "demo-project",
+          path: "D:/mock/demo-project",
+          cwdPath: "D:/mock/demo-project",
+          modifiedMs: Date.now() - 250,
+          source: "vscode",
+        },
+      ]
+    : [];
+  const vscodeEntries = includeVscode
+    ? [
+        {
+          entryType: "session",
+          label: "vscode-session.json",
+          path: "C:/Users/mock/AppData/Roaming/Code/User/workspaceStorage/hash/chatSessions/vscode-session.json",
+          parentSession: null,
+          modifiedMs: Date.now() - 300,
+          sizeBytes: 320,
+          source: "vscode",
+        },
+      ]
+    : [];
 
   const invoke = async (cmd, args = {}) => {
     calls.push({ cmd, args });
     if (cmd === "list_projects") return claudeProjects;
     if (cmd === "list_codex_projects") return codexProjects;
+    if (cmd === "list_vscode_copilot_projects") return vscodeProjects;
     if (cmd === "list_project_entries") return claudeEntries;
     if (cmd === "list_codex_project_entries") return codexEntries;
+    if (cmd === "list_vscode_copilot_project_entries") return vscodeEntries;
     if (cmd === "get_project_delete_impact") {
       return {
         sessionCount: 2,
@@ -240,6 +271,65 @@ function createMockInvoke() {
         },
       };
     }
+    if (cmd === "read_vscode_copilot_session_timeline") {
+      return {
+        path: args.sessionPath,
+        errorCode: null,
+        errors: [],
+        events: [
+          {
+            line: 1,
+            timestamp: "1779194731541",
+            role: "assistant",
+            eventType: "vscode_turn",
+            requestId: "vscode-req-1",
+            summary: "show me the test plan\nVS Code answer",
+            raw: {
+              type: "vscode_turn",
+              vscodeTurn: {
+                response: {
+                  type: "message",
+                  message: {
+                    role: "assistant",
+                    model: "gpt-5.4",
+                    content: [
+                      { type: "text", text: "VS Code answer" },
+                      { type: "thinking", thinking: "VS Code hidden reasoning" },
+                      {
+                        type: "tool_use",
+                        id: "vscode-tool-1",
+                        name: "copilot_readFile",
+                        input: { invocationMessage: "Reading package.json" },
+                      },
+                      {
+                        type: "tool_use",
+                        id: "vscode-file-1",
+                        name: "VSCodeFileChange",
+                        input: { file_path: "/tmp/app.js", edit_count: 2, done: true },
+                      },
+                    ],
+                  },
+                },
+                request: {
+                  type: "message",
+                  message: {
+                    role: "user",
+                    content: [{ type: "text", text: "show me the test plan" }],
+                  },
+                },
+              },
+            },
+          },
+        ],
+        metadata: {
+          modelName: "copilot",
+          totalInputTokens: null,
+          totalOutputTokens: null,
+          startTime: "2026-03-05T09:00:00Z",
+          endTime: "2026-03-05T09:01:00Z",
+        },
+      };
+    }
     if (cmd === "read_memory") {
       return { path: args.memoryPath, content: "mock-memory" };
     }
@@ -301,12 +391,14 @@ async function setupApp(options = {}) {
     }
   }
 
-  const mock = createMockInvoke();
+  const mock = createMockInvoke(options);
   const openedPaths = [];
+  const revealedPaths = [];
   window.__TAURI__ = {
     core: { invoke: mock.invoke },
     opener: {
       openPath: async (p) => { openedPaths.push(p); },
+      revealItemInDir: async (p) => { revealedPaths.push(p); },
     },
   };
 
@@ -314,7 +406,7 @@ async function setupApp(options = {}) {
   window.dispatchEvent(new window.Event("DOMContentLoaded"));
   await new Promise((resolve) => setTimeout(resolve, 30));
 
-  return { window, mock, openedPaths, cleanup: () => dom.window.close() };
+  return { window, mock, openedPaths, revealedPaths, cleanup: () => dom.window.close() };
 }
 
 test("project delete dialog shows impact and confirms by exact name", async () => {
@@ -398,6 +490,91 @@ test("project delete removes hybrid project without source-toggle resurrection",
   window.document.querySelector("#source-toggle-codex").click();
   await new Promise((resolve) => setTimeout(resolve, 20));
 
+  assert.equal(window.document.querySelector(".project-btn"), null);
+  app.cleanup();
+});
+
+test("vscode copilot projects list entries and render timelines", async () => {
+  const app = await setupApp({ includeVscode: true, vscodeOnly: true });
+  const { window, mock } = app;
+
+  const projectButton = window.document.querySelector(".project-btn");
+  assert.ok(projectButton, "VS Code project row should exist");
+  assert.match(projectButton.textContent, /demo-project/);
+  assert.equal(window.document.querySelector(".source-badge--vscode")?.textContent, "VS Code");
+
+  projectButton.closest(".list-row").dispatchEvent(
+    new window.MouseEvent("contextmenu", { bubbles: true, clientX: 100, clientY: 100 }),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  let menuItems = [...window.document.querySelectorAll(".ctx-menu-item")];
+  assert.equal(menuItems.some((el) => /delete/i.test(el.textContent)), false);
+  window.document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+
+  projectButton.click();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const entryRow = window.document.querySelector(".entry-row.list-row");
+  assert.ok(entryRow, "VS Code entry row should exist");
+  assert.equal(entryRow.querySelector(".source-badge--vscode")?.textContent, "VS Code");
+  assert.equal(
+    mock.calls.some((call) => call.cmd === "list_vscode_copilot_project_entries"),
+    true,
+  );
+
+  entryRow.dispatchEvent(
+    new window.MouseEvent("contextmenu", { bubbles: true, clientX: 120, clientY: 120 }),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  menuItems = [...window.document.querySelectorAll(".ctx-menu-item")];
+  assert.equal(menuItems.some((el) => /delete/i.test(el.textContent)), false);
+  window.document.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+
+  entryRow.querySelector(".entry-btn").click();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(
+    mock.calls.some((call) => call.cmd === "read_vscode_copilot_session_timeline"),
+    true,
+  );
+  assert.match(window.document.body.textContent, /VS Code answer/);
+  const chatTexts = [...window.document.querySelectorAll(".user-msg-text, .assist-text")]
+    .map((node) => (node.textContent || "").trim())
+    .filter(Boolean);
+  assert.ok(chatTexts.indexOf("show me the test plan") > -1);
+  assert.ok(chatTexts.indexOf("VS Code answer") > -1);
+  assert.equal(chatTexts.indexOf("show me the test plan") < chatTexts.indexOf("VS Code answer"), true);
+  const vscodeAssistantTitle = [...window.document.querySelectorAll(".role-lbl.assist-role")]
+    .map((node) => (node.textContent || "").trim())
+    .find((text) => text.startsWith("VS Code"));
+  assert.equal(vscodeAssistantTitle, "VS Code (gpt-5.4)");
+  const timeLabels = [...window.document.querySelectorAll(".time-lbl")]
+    .map((node) => (node.textContent || "").trim())
+    .filter(Boolean);
+  assert.equal(timeLabels.some((text) => text.includes("1779194731541")), false);
+  assert.equal(timeLabels.some((text) => /\d{4}/.test(text)), true);
+  assert.equal(window.document.querySelectorAll(".assistant-thinking-text").length, 0);
+  assert.equal(window.document.querySelectorAll(".assistant-tool-title").length, 0);
+
+  window.document.querySelector("#hide-thinking-events-toggle").click();
+  window.document.querySelector("#hide-tool-events-toggle").click();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const thinkingTexts = [...window.document.querySelectorAll(".assistant-thinking-text")]
+    .map((node) => (node.textContent || "").trim());
+  const toolTitles = [...window.document.querySelectorAll(".assistant-tool-title")]
+    .map((node) => (node.textContent || "").trim());
+  const toolLines = [...window.document.querySelectorAll(".assistant-tool-line")]
+    .map((node) => (node.textContent || "").trim());
+  assert.equal(thinkingTexts.some((text) => /VS Code hidden reasoning/.test(text)), true);
+  assert.equal(toolTitles.some((text) => /(Copilot 工具|Copilot tool): copilot_readFile/.test(text)), true);
+  assert.equal(toolTitles.some((text) => /(VS Code 檔案變更|VS Code file changes)/.test(text)), true);
+  assert.equal(toolLines.some((text) => /\/tmp\/app\.js/.test(text)), true);
+
+  window.document.querySelector("#source-toggle-vscode").click();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(window.document.querySelector("#source-toggle-vscode").getAttribute("aria-pressed"), "false");
   assert.equal(window.document.querySelector(".project-btn"), null);
   app.cleanup();
 });
@@ -755,9 +932,9 @@ test("project context menu shows open folder and delete options", async () => {
   app.cleanup();
 });
 
-test("session context menu shows copy session id and delete options", async () => {
+test("session context menu shows copy session id, open file location, and delete options", async () => {
   const app = await setupApp();
-  const { window } = app;
+  const { window, revealedPaths } = app;
 
   // 先選取專案，讓 entries 出現
   const projectButton = window.document.querySelector(".project-btn");
@@ -773,9 +950,14 @@ test("session context menu shows copy session id and delete options", async () =
   await new Promise((resolve) => setTimeout(resolve, 10));
 
   const items = window.document.querySelectorAll(".ctx-menu-item");
-  assert.equal(items.length, 2, "session context menu should have 2 items");
+  assert.equal(items.length, 3, "session context menu should have 3 items");
   assert.match(items[0].textContent, /Copy Session ID|複製 Session ID/i);
-  assert.match(items[1].textContent, /Delete|刪除/i);
+  assert.match(items[1].textContent, /Open file location|開啟檔案位置/i);
+  assert.match(items[2].textContent, /Delete|刪除/i);
+
+  items[1].click();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(revealedPaths, ["D:/mock/demo-project/alpha.jsonl"]);
 
   app.cleanup();
 });

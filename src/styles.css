@@ -1904,6 +1904,12 @@ body.resizing-columns {
   border-color: #0d0d0d;
 }
 
+.source-toggle-btn[data-source="vscode"][data-active="true"] {
+  background: #eaf5ff;
+  color: #0067b8;
+  border-color: #0067b8;
+}
+
 /* dark mode: flip fg/bg roles for legibility */
 [data-theme="dark"] .source-toggle-btn[data-source="claude"][data-active="true"] {
   background: #3a1c0a;
@@ -1915,6 +1921,12 @@ body.resizing-columns {
   background: #1a1a1a;
   color: #f9f9f9;
   border-color: #f9f9f9;
+}
+
+[data-theme="dark"] .source-toggle-btn[data-source="vscode"][data-active="true"] {
+  background: #082f4f;
+  color: #8fd0ff;
+  border-color: #8fd0ff;
 }
 
 /* Source badge on session entries, project list, and chat bubbles */
@@ -1954,6 +1966,18 @@ body.resizing-columns {
   background: #1a1a1a;
   color: #f9f9f9;
   border-color: #f9f9f9;
+}
+
+.source-badge--vscode {
+  background: #eaf5ff;
+  color: #0067b8;
+  border: 1px solid #0067b8;
+}
+
+[data-theme="dark"] .source-badge--vscode {
+  background: #082f4f;
+  color: #8fd0ff;
+  border-color: #8fd0ff;
 }
 
 .project-sources {
